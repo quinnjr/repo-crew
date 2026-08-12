@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Repo Crew
+GenericName=Multi-repo GitHub triage
+Comment=Sweep, triage and merge pull requests across every repository you maintain
+Exec=repo-crew
+Icon=repo-crew
+Terminal=false
+Categories=Development;RevisionControl;
+Keywords=git;github;dependabot;pull request;issue;triage;
+StartupNotify=true
+StartupWMClass=Repo Crew

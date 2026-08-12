@@ -1,0 +1,96 @@
+# Maintainer: Joseph Quinn <jquinn@lexmata.ai>
+#
+# Builds Repo Crew from the git checkout this file lives in.
+#
+#   cd packaging/arch && makepkg -si
+#
+# Two things to know before running it:
+#
+#   * makepkg packages COMMITTED state. It clones the repo rather than copying
+#     the working tree, so uncommitted changes are not included. Commit first.
+#   * This PKGBUILD deliberately does not live at the repo root: makepkg would
+#     create ./src and ./pkg there and clobber the application's own src/.
+
+pkgname=repo-crew
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Multi-repo GitHub triage — sweep, group and merge dependency updates across a whole fleet'
+arch=('x86_64' 'aarch64')
+
+url='https://github.com/quinnjr/repo-crew'
+license=('MIT OR Apache-2.0')
+
+# webkit2gtk-4.1 is the Tauri v2 webview on Linux (v2 does NOT use 4.0).
+# dbus is needed at runtime by the keyring crate's secret-service backend,
+# which links libdbus-1 rather than talking the protocol itself.
+depends=('webkit2gtk-4.1' 'gtk3' 'dbus' 'hicolor-icon-theme')
+makedepends=('cargo' 'nodejs' 'pnpm' 'git' 'pkgconf')
+
+# The token is stored via the Secret Service API. Without a provider running,
+# the app starts but cannot save or read a GitHub token — so one of these is
+# effectively required, listed as optdepends only because any of them will do.
+optdepends=(
+  'gnome-keyring: Secret Service provider for storing the GitHub token'
+  'kwallet: Secret Service provider for storing the GitHub token (KDE)'
+  'keepassxc: Secret Service provider for storing the GitHub token'
+)
+
+provides=('repo-crew')
+conflicts=('repo-crew-git')
+options=('!lto')
+
+_repo="$(realpath -- "${startdir}/../..")"
+source=("${pkgname}::git+file://${_repo}")
+sha256sums=('SKIP')
+
+pkgver() {
+  # Single source of truth, so pkgver cannot drift from package.json,
+  # Cargo.toml and tauri.conf.json.
+  cd "${srcdir}/${pkgname}"
+  node -p "require('./package.json').version"
+}
+
+prepare() {
+  cd "${srcdir}/${pkgname}"
+  # Reproducible installs from the lockfiles rather than whatever resolves today.
+  pnpm install --frozen-lockfile
+  cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+}
+
+build() {
+  cd "${srcdir}/${pkgname}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=src-tauri/target
+
+  # --no-bundle stops Tauri building the AppImage payload we would only
+  # throw away; pacman is doing the packaging. `tauri build` still runs the
+  # configured beforeBuildCommand (vite build) to produce dist/.
+  pnpm tauri build --no-bundle
+}
+
+check() {
+  cd "${srcdir}/${pkgname}"
+  pnpm test
+  cargo test --manifest-path src-tauri/Cargo.toml --release
+}
+
+package() {
+  cd "${srcdir}/${pkgname}"
+
+  install -Dm755 "src-tauri/target/release/${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
+
+  install -Dm644 "packaging/arch/dev.quinnjr.repo-crew.desktop" \
+    "${pkgdir}/usr/share/applications/dev.quinnjr.repo-crew.desktop"
+
+  # MIT requires shipping its text; Apache-2.0 is in licenses/ for symmetry.
+  install -Dm644 "LICENSE-MIT" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"
+  install -Dm644 "LICENSE-APACHE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-APACHE"
+
+  # 128x128@2x.png is a 256px asset despite the name.
+  install -Dm644 "src-tauri/icons/32x32.png" \
+    "${pkgdir}/usr/share/icons/hicolor/32x32/apps/${pkgname}.png"
+  install -Dm644 "src-tauri/icons/128x128.png" \
+    "${pkgdir}/usr/share/icons/hicolor/128x128/apps/${pkgname}.png"
+  install -Dm644 "src-tauri/icons/128x128@2x.png" \
+    "${pkgdir}/usr/share/icons/hicolor/256x256/apps/${pkgname}.png"
+}

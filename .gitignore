@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+
+# Rust / Tauri build artefacts
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Worktrees
+.worktrees/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Local environment overrides
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local-only planning documents and session notes — never committed
+docs/plans/
+PLAN.md
+MEMORY.md
+
+# makepkg working directories and built packages
+packaging/arch/src/
+packaging/arch/pkg/
+packaging/arch/*.pkg.tar.*
+packaging/arch/*.tar.gz

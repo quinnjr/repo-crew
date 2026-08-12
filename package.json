@@ -1,0 +1,39 @@
+{
+  "name": "repo-crew",
+  "private": true,
+  "version": "0.1.0",
+  "license": "(MIT OR Apache-2.0)",
+  "packageManager": "pnpm@11.13.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run && cargo test --manifest-path src-tauri/Cargo.toml",
+    "lint": "oxlint src",
+    "lint:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings"
+  },
+  "devDependencies": {
+    "@fontsource-variable/martian-mono": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/ibm-plex-sans": "^5.3.0",
+    "@sveltejs/vite-plugin-svelte": "^7.2.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/node": "^26.1.2",
+    "oxlint": "^1.78.0",
+    "svelte": "^5.56.8",
+    "svelte-check": "^4.7.4",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^6.0.3",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10"
+  },
+  "dependencies": {
+    "@fortawesome/fontawesome-free": "^7.3.1",
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-opener": "^2.5.4"
+  }
+}

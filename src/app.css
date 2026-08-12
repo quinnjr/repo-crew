@@ -1,0 +1,176 @@
+@import 'tailwindcss';
+
+/*
+  Repo Crew — "annunciator panel"
+  ------------------------------------------------------------------
+  The ground is painted steel, warm olive-graphite. Green / amber / red
+  are SIGNAL LAMPS: they are reserved exclusively for machine status and
+  never used for chrome, emphasis, or branding. Brass is the only
+  interactive accent — focus rings, the active rail marker, the pivot.
+  If a colour is doing decoration, it is in the wrong place.
+*/
+
+@theme {
+  --font-display: 'Martian Mono Variable', 'IBM Plex Mono', ui-monospace, monospace;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', monospace;
+  --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+
+  --color-ground: var(--ground);
+  --color-panel: var(--panel);
+  --color-raised: var(--raised);
+  --color-hover: var(--hover);
+  --color-field: var(--field);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-brass: var(--brass);
+  --color-brass-hi: var(--brass-hi);
+  --color-go: var(--go);
+  --color-hold: var(--hold);
+  --color-stop: var(--stop);
+}
+
+/* ---------------- dark: panel under work light (default) ---------------- */
+:root {
+  color-scheme: dark;
+  --ground: #14170f;
+  --panel: #1b1f15;
+  --raised: #232819;
+  --hover: #2a2f1f;
+  --field: #191d13;
+  --line: #333a28;
+  --line-strong: #4d563e;
+  --ink: #e8eadf;
+  --ink-2: #b2b8a3;
+  --ink-3: #7b826c;
+  --brass: #c9a227;
+  --brass-hi: #e0ba3e;
+  --go: #45c08a;
+  --hold: #e0a63a;
+  --stop: #e2604d;
+  --overlay: rgba(8, 10, 5, 0.72);
+  --lamp-off: #2f3625;
+}
+
+/* ---------------- light: same panel, daylight ---------------- */
+[data-theme='light'] {
+  color-scheme: light;
+  --ground: #dfe1d3;
+  --panel: #eff1e6;
+  --raised: #f9faf2;
+  --hover: #d5d8c6;
+  --field: #f9faf2;
+  --line: #c3c7b1;
+  --line-strong: #a3a98f;
+  --ink: #1d2116;
+  --ink-2: #4c523f;
+  --ink-3: #767c66;
+  --brass: #7a6010;
+  --brass-hi: #5e4a0a;
+  --go: #17724e;
+  --hold: #855309;
+  --stop: #a93b2b;
+  --overlay: rgba(29, 33, 22, 0.5);
+  --lamp-off: #c6c9b4;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-feature-settings: 'zero' 1;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--brass) 34%, transparent);
+}
+
+/* Keyboard focus must always be visible; pointer focus stays quiet. */
+:focus-visible {
+  outline: 2px solid var(--brass);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ---------------- signal lamps ----------------
+   A row of checks renders as fixed-width cells rather than a badge, so
+   scanning DOWN a column shows the same job failing across the fleet. */
+.lamp {
+  display: inline-block;
+  width: 7px;
+  height: 12px;
+  border-radius: 1px;
+  background: var(--lamp-off);
+}
+.lamp-go {
+  background: var(--go);
+}
+.lamp-hold {
+  background: var(--hold);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.lamp-stop {
+  background: var(--stop);
+}
+
+/* Etched engraving used for section labels and the rail. */
+.engraved {
+  font-family: var(--font-display);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--ink-3);
+}
+
+/* ---------------- motion ----------------
+   One orchestrated moment: the ledger settles like a split-flap board.
+   Everything else is a plain state change. */
+.settle {
+  animation: settle 0.26s cubic-bezier(0.2, 0.9, 0.3, 1) backwards;
+}
+
+@keyframes settle {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
