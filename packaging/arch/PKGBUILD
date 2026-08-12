@@ -62,6 +62,13 @@ build() {
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=src-tauri/target
 
+  # OAuth credentials are compiled in (option_env!) and never committed.
+  # Without them the app builds but cannot sign anyone in, so fail loudly
+  # here instead of packaging a binary that only shows an error screen.
+  : "${REPO_CREW_GH_CLIENT_ID:?set REPO_CREW_GH_CLIENT_ID before makepkg}"
+  : "${REPO_CREW_GH_CLIENT_SECRET:?set REPO_CREW_GH_CLIENT_SECRET before makepkg}"
+  : "${REPO_CREW_GH_APP_SLUG:?set REPO_CREW_GH_APP_SLUG before makepkg}"
+
   # --no-bundle stops Tauri building the AppImage payload we would only
   # throw away; pacman is doing the packaging. `tauri build` still runs the
   # configured beforeBuildCommand (vite build) to produce dist/.

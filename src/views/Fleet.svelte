@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { openUrl } from '@tauri-apps/plugin-opener'
   import { allRepos, allReposLoaded, goTo, selectedRepos, selectedRepoSet, toggleRepo, viewer, toast } from '../lib/stores'
   import { loadRepos } from '../lib/api'
+  import { installUrl, oauthConfig } from '../lib/auth'
   import { ago, pluralise } from '../lib/util'
   import Header from '../components/Header.svelte'
   import Spinner from '../components/Spinner.svelte'
@@ -9,6 +11,13 @@
   let query = $state('')
   let showArchived = $state(false)
   let loading = $state(false)
+  let appSlug = $state<string | null>(null)
+
+  $effect(() => {
+    oauthConfig()
+      .then((c) => (appSlug = c.slug))
+      .catch(() => {})
+  })
 
   const load = async (force: boolean) => {
     if (loading) return
@@ -91,11 +100,15 @@
   {#if loading && !$allReposLoaded}
     <div class="flex flex-1 items-center justify-center"><Spinner label="Listing repositories…" /></div>
   {:else if $allRepos.length === 0}
+    <!-- The app only sees repositories where it is installed, so a fresh
+         sign-in legitimately lands here — the install page is the way out. -->
     <EmptyState
       icon="fa-solid fa-layer-group"
       title="No repositories found"
-      body="The token needs read access to repository metadata. Check it under Settings."
-      action={{ label: 'Open settings', onclick: () => goTo('settings') }}
+      body="Repo Crew can only see repositories where the GitHub App is installed. Install it on your account or organisation, then refresh."
+      action={appSlug
+        ? { label: 'Install the app on GitHub', onclick: () => appSlug && openUrl(installUrl(appSlug)) }
+        : { label: 'Open settings', onclick: () => goTo('settings') }}
     />
   {:else if filtered.length === 0}
     <EmptyState

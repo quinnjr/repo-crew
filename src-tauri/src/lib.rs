@@ -3,9 +3,12 @@ use serde_json::{json, Value};
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tauri::Manager;
+
+mod oauth;
 
 /// Keychain coordinates, matching the bundle identifier in `tauri.conf.json`.
 ///
@@ -22,26 +25,55 @@ const LEGACY_TOKEN_FILE: &str = "token.txt";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-struct AppState {
+/// The credential as it lives in the keychain, serialised as JSON.
+///
+/// `refresh`/`expires_at` are absent when GitHub issues a non-expiring token
+/// (user-token expiry disabled on the app). Values stored by pre-OAuth
+/// versions are bare PAT strings — `parse_stored` accepts those too, so an
+/// existing install stays signed in until it signs out.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredToken {
+    pub(crate) access: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) refresh: Option<String>,
+    /// Unix seconds after which `access` stops working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expires_at: Option<u64>,
+}
+
+pub(crate) struct AppState {
     /// In-process cache so a fleet sweep does not hit the keychain once per
     /// query — some backends prompt or rate-limit on repeated reads. Cleared
     /// when GitHub rejects the token, so a revoked credential does not keep
     /// being re-sent for the rest of the process lifetime.
-    token: Mutex<Option<String>>,
-    /// The token GitHub last answered 401 to. Without this, the 401 clears
-    /// the cache and the very next query reads the same dead token straight
-    /// back out of the keychain — an infinite 401 loop that never reaches the
-    /// sign-in screen.
+    token: Mutex<Option<StoredToken>>,
+    /// The access token GitHub last answered 401 to (and that could not be
+    /// refreshed). Without this, the 401 clears the cache and the very next
+    /// query reads the same dead token straight back out of the keychain —
+    /// an infinite 401 loop that never reaches the sign-in screen.
     rejected: Mutex<Option<String>>,
+    /// Refresh tokens are single-use: this gate serialises refreshes so two
+    /// parallel queries cannot burn the same one (the loser would sign the
+    /// whole app out).
+    refresh_gate: Mutex<()>,
+    /// Cancel flag for the in-flight browser sign-in, if any.
+    pub(crate) login_cancel: Mutex<Option<Arc<AtomicBool>>>,
     /// One agent for the whole process: connection pooling and keep-alive,
     /// instead of a fresh TLS handshake per query.
-    agent: ureq::Agent,
+    pub(crate) agent: ureq::Agent,
 }
 
 /// Survive a poisoned mutex rather than panicking. The token path is exactly
 /// where a previous panic should degrade instead of cascading.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn entry() -> Result<Entry, String> {
@@ -51,19 +83,46 @@ fn entry() -> Result<Entry, String> {
 /// A token goes into an `Authorization` header, where a control byte turns
 /// into a malformed request (or worse, header injection). GitHub tokens are
 /// ASCII; anything else was a paste accident.
-fn valid_token_bytes(token: &str) -> bool {
+pub(crate) fn valid_token_bytes(token: &str) -> bool {
     !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic())
 }
 
+/// Read a keychain value into a token: JSON from an OAuth sign-in, or a bare
+/// string from a pre-OAuth install (treated as a non-expiring access token).
+pub(crate) fn parse_stored(raw: &str) -> Option<StoredToken> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<StoredToken>(trimmed) {
+        Ok(token) if valid_token_bytes(&token.access) => Some(token),
+        Ok(_) => None,
+        Err(_) => valid_token_bytes(trimmed).then(|| StoredToken {
+            access: trimmed.to_string(),
+            refresh: None,
+            expires_at: None,
+        }),
+    }
+}
+
 /// The precedence seam between the storage layers, pure so it can be tested
-/// without a keychain: cache wins, blank values fall through, and a token
-/// GitHub already rejected never comes back.
-fn pick_token(cached: Option<String>, stored: Option<String>, rejected: Option<&str>) -> Option<String> {
+/// without a keychain: cache wins, blank/malformed values fall through, and
+/// an access token GitHub already rejected never comes back.
+fn pick_stored(
+    cached: Option<StoredToken>,
+    stored_raw: Option<String>,
+    rejected: Option<&str>,
+) -> Option<StoredToken> {
     cached
         .into_iter()
-        .chain(stored)
-        .map(|t| t.trim().to_string())
-        .find(|t| valid_token_bytes(t) && Some(t.as_str()) != rejected)
+        .chain(stored_raw.as_deref().and_then(parse_stored))
+        .find(|t| Some(t.access.as_str()) != rejected)
+}
+
+/// Refresh a minute early so a token cannot expire between this check and the
+/// request that uses it.
+pub(crate) fn needs_refresh(expires_at: Option<u64>, now: u64) -> bool {
+    matches!(expires_at, Some(t) if now + 60 >= t)
 }
 
 /// Overwrite then unlink. An unlink alone leaves the plaintext token
@@ -106,7 +165,7 @@ fn migrate_legacy_token(app: &tauri::AppHandle) -> Option<String> {
 ///
 /// A locked or absent Secret Service is not the same as a missing token:
 /// reporting it as missing would route the user to sign-in and invite them to
-/// paste a token into a keychain that cannot store it.
+/// authorize into a keychain that cannot store the result.
 fn read_keychain() -> Result<Option<String>, String> {
     match entry()?.get_password() {
         Ok(t) => Ok(Some(t)),
@@ -115,54 +174,96 @@ fn read_keychain() -> Result<Option<String>, String> {
     }
 }
 
-/// Resolve the token from cache, then the keychain, then the legacy file.
-///
-/// `Ok(None)` means signed out; `Err` means the keychain itself is unusable.
-/// Note this is not side-effect free: on first call it may perform the legacy
-/// migration (writing the keychain and deleting `token.txt`).
-fn resolve_token(app: &tauri::AppHandle, state: &AppState) -> Result<Option<String>, String> {
+/// Persist a token everywhere it lives: keychain first (the durable copy),
+/// then the in-process cache. A fresh credential also clears the rejected
+/// marker — it has earned a fresh chance.
+pub(crate) fn store_token(app: &tauri::AppHandle, token: &StoredToken) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let raw = serde_json::to_string(token).map_err(|e| format!("could not encode the token: {e}"))?;
+    entry()?
+        .set_password(&raw)
+        .map_err(|e| format!("could not save to the keychain: {e}"))?;
+    *lock(&state.token) = Some(token.clone());
+    *lock(&state.rejected) = None;
+    Ok(())
+}
+
+/// Resolve the credential from cache, then the keychain, then the legacy
+/// file. `Ok(None)` means signed out; `Err` means the keychain itself is
+/// unusable. Note this is not side-effect free: on first call it may perform
+/// the legacy migration (writing the keychain and deleting `token.txt`).
+fn resolve_token(app: &tauri::AppHandle, state: &AppState) -> Result<Option<StoredToken>, String> {
     if let Some(cached) = lock(&state.token).clone() {
         return Ok(Some(cached));
     }
     let stored = read_keychain()?;
     let rejected = lock(&state.rejected).clone();
-    let token = pick_token(None, stored, rejected.as_deref())
-        .or_else(|| pick_token(None, migrate_legacy_token(app), rejected.as_deref()));
+    let token = pick_stored(None, stored, rejected.as_deref())
+        .or_else(|| pick_stored(None, migrate_legacy_token(app), rejected.as_deref()));
     if let Some(t) = &token {
         *lock(&state.token) = Some(t.clone());
     }
     Ok(token)
 }
 
-#[tauri::command]
-fn set_token(state: tauri::State<'_, AppState>, token: String) -> Result<(), String> {
-    let trimmed = token.trim().to_string();
-    if trimmed.is_empty() {
-        return Err("token is empty".into());
-    }
-    if !valid_token_bytes(&trimmed) {
-        return Err("token contains characters that cannot go in an HTTP header".into());
-    }
-    entry()?
-        .set_password(&trimmed)
-        .map_err(|e| format!("could not save to the keychain: {e}"))?;
-    *lock(&state.token) = Some(trimmed);
-    // A fresh credential gets a fresh chance, even if it equals the old one —
-    // the user may have un-revoked it, and one wasted 401 is cheap.
-    *lock(&state.rejected) = None;
-    Ok(())
+/// What a refresh attempt concluded — the caller acts differently on each.
+enum RefreshOutcome {
+    /// A fresh (or freshly-observed) credential to use.
+    Refreshed(StoredToken),
+    /// GitHub declared the credential dead; it has been cleared.
+    Rejected,
+    /// GitHub could not be asked. The credential is untouched: a network
+    /// blip at the wrong moment must not sign the user out.
+    Unreachable(String),
 }
 
-/// Remove the credential everywhere.
+/// Trade the refresh token for a new pair, serialised through `refresh_gate`.
 ///
-/// The keychain entry goes first: clearing the cache before a delete that then
-/// fails would leave the app "logged out" while the credential survives on
-/// disk, silently signing the user back in on the next launch. The legacy
-/// file is shredded, and an unresolvable config dir is reported rather than
-/// swallowed — that is the one case where a plaintext copy could survive a
-/// "sign out" without the user hearing about it.
-#[tauri::command]
-fn clear_token(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+/// If another thread already refreshed while this one waited at the gate, its
+/// result is reused instead of burning the (single-use) refresh token twice.
+/// Only a definitive rejection clears the stored credential: the pair is dead
+/// then, and keeping it would loop the app through 401s forever. An expired
+/// token with no refresh token is equally dead and cleared the same way.
+fn refresh_and_store(app: &tauri::AppHandle, stale: &StoredToken) -> RefreshOutcome {
+    let state = app.state::<AppState>();
+    let _gate = lock(&state.refresh_gate);
+
+    if let Some(current) = lock(&state.token).clone() {
+        if current.access != stale.access {
+            return RefreshOutcome::Refreshed(current);
+        }
+    }
+    let Some(refresh) = stale.refresh.clone() else {
+        log::info!("token expired with no refresh token; clearing the dead credential");
+        let _ = clear_stored(app);
+        return RefreshOutcome::Rejected;
+    };
+    match oauth::refresh_grant(&state.agent, &refresh) {
+        Ok(fresh) => {
+            if let Err(e) = store_token(app, &fresh) {
+                // The new token works for this session even if it could not
+                // be persisted; the next launch just signs in again.
+                log::warn!("refreshed the token but could not store it: {e}");
+                *lock(&state.token) = Some(fresh.clone());
+            }
+            RefreshOutcome::Refreshed(fresh)
+        }
+        Err(oauth::TokenEndpointError::Rejected(e)) => {
+            log::warn!("GitHub rejected the refresh token: {e}");
+            let _ = clear_stored(app);
+            RefreshOutcome::Rejected
+        }
+        Err(oauth::TokenEndpointError::Unreachable(e)) => {
+            log::warn!("could not reach GitHub to refresh the token: {e}");
+            RefreshOutcome::Unreachable(e)
+        }
+    }
+}
+
+/// Remove the credential everywhere. See `clear_token` for the ordering
+/// rationale.
+fn clear_stored(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
     let keychain = match entry() {
         Ok(e) => match e.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -173,7 +274,9 @@ fn clear_token(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Resu
 
     let legacy = match app.path().app_config_dir() {
         Ok(dir) => remove_legacy_file(&dir.join(LEGACY_TOKEN_FILE)),
-        Err(e) => Err(format!("could not locate the config dir to clear the legacy token file: {e}")),
+        Err(e) => Err(format!(
+            "could not locate the config dir to clear the legacy token file: {e}"
+        )),
     };
 
     *lock(&state.token) = None;
@@ -181,52 +284,114 @@ fn clear_token(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Resu
     keychain.and(legacy)
 }
 
-/// Reports whether a token is stored — never the token itself, so the secret
-/// stays out of the webview. `Err` means the keychain cannot be asked (locked
-/// or missing Secret Service), which the frontend surfaces instead of showing
-/// sign-in. See `resolve_token` for its migration side effect.
+/// Remove the credential everywhere (access and refresh token together).
+///
+/// The keychain entry goes first: clearing the cache before a delete that then
+/// fails would leave the app "logged out" while the credential survives on
+/// disk, silently signing the user back in on the next launch. The legacy
+/// file is shredded, and an unresolvable config dir is reported rather than
+/// swallowed — that is the one case where a plaintext copy could survive a
+/// "sign out" without the user hearing about it.
+#[tauri::command]
+fn clear_token(app: tauri::AppHandle) -> Result<(), String> {
+    clear_stored(&app)
+}
+
+/// Reports whether a credential is stored — never the credential itself, so
+/// secrets stay out of the webview. `Err` means the keychain cannot be asked
+/// (locked or missing Secret Service), which the frontend surfaces instead of
+/// showing sign-in. See `resolve_token` for its migration side effect.
 #[tauri::command]
 fn has_token(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<bool, String> {
     resolve_token(&app, &state).map(|t| t.is_some())
 }
 
-/// Ask GitHub who a token belongs to WITHOUT storing it.
-///
-/// Settings uses this to vet a replacement token before overwriting the
-/// working credential — storing first and rolling back on failure would
-/// destroy the good token to test the bad one.
-#[tauri::command]
-async fn validate_token(state: tauri::State<'_, AppState>, token: String) -> Result<String, String> {
-    let trimmed = token.trim().to_string();
-    if trimmed.is_empty() {
-        return Err("token is empty".into());
-    }
-    if !valid_token_bytes(&trimmed) {
-        return Err("token contains characters that cannot go in an HTTP header".into());
+/// The blocking body of `github_graphql`: resolve (refreshing an expired
+/// token proactively), send, and on an unexpected 401 refresh-and-retry once
+/// before declaring the session dead.
+fn execute_graphql(app: &tauri::AppHandle, payload: Value) -> Value {
+    let state = app.state::<AppState>();
+
+    let mut token = match resolve_token(app, &state) {
+        Ok(Some(t)) => t,
+        Ok(None) => return json!({ "ok": false, "error": "not_authenticated", "status": 0 }),
+        Err(e) => {
+            return json!({ "ok": false, "error": "keychain_unavailable", "detail": e, "status": 0 })
+        }
+    };
+
+    if needs_refresh(token.expires_at, now_unix()) {
+        token = match refresh_and_store(app, &token) {
+            RefreshOutcome::Refreshed(t) => t,
+            RefreshOutcome::Rejected => {
+                return json!({ "ok": false, "error": "not_authenticated", "status": 0 })
+            }
+            // GitHub is unreachable for refreshes, but this request may still
+            // land inside the 60 s early-refresh window — and if the token is
+            // truly dead, the 401 path below reports the real situation.
+            RefreshOutcome::Unreachable(_) => token,
+        };
     }
 
-    let agent = state.agent.clone();
-    let response = tauri::async_runtime::spawn_blocking(move || {
-        agent
+    let mut refreshed = false;
+    loop {
+        let response = state
+            .agent
             .post("https://api.github.com/graphql")
-            .set("Authorization", &format!("Bearer {trimmed}"))
+            .set("Authorization", &format!("Bearer {}", token.access))
             .set("Accept", "application/vnd.github+json")
             .set("X-GitHub-Api-Version", "2022-11-28")
-            .send_json(json!({ "query": "query { viewer { login } }" }))
-            .map_err(Box::new)
-    })
-    .await
-    .map_err(|e| format!("request task failed: {e}"))?;
+            // By reference: cloning the whole query tree on every send would
+            // tax each of the many calls in a sweep for the sake of the rare
+            // once-per-8-hours retry below.
+            .send_json(&payload);
 
-    match response.map_err(|e| *e) {
-        Ok(resp) => resp
-            .into_json::<Value>()
-            .ok()
-            .and_then(|v| v["data"]["viewer"]["login"].as_str().map(str::to_string))
-            .ok_or_else(|| "GitHub did not return an account for that token".into()),
-        Err(ureq::Error::Status(401, _)) => Err("GitHub rejected the token".into()),
-        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
-        Err(e) => Err(e.to_string()),
+        return match response {
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.into_json::<Value>() {
+                    Ok(body) => json!({ "ok": true, "status": status, "data": body }),
+                    Err(e) => json!({ "ok": false, "error": e.to_string(), "status": status }),
+                }
+            }
+            Err(ureq::Error::Status(401, resp)) => {
+                // An 8-hour token can die mid-session; one refresh gets the
+                // sweep back without a trip through the sign-in screen.
+                if !refreshed && token.refresh.is_some() {
+                    refreshed = true;
+                    match refresh_and_store(app, &token) {
+                        RefreshOutcome::Refreshed(fresh) => {
+                            token = fresh;
+                            continue;
+                        }
+                        RefreshOutcome::Rejected => {
+                            return json!({ "ok": false, "error": "not_authenticated", "status": 401 })
+                        }
+                        // The access token 401'd but the refresh endpoint is
+                        // unreachable — report a transient failure and keep
+                        // the credential; the next request tries again.
+                        RefreshOutcome::Unreachable(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": format!("could not refresh the session: {e}"),
+                                "status": 0
+                            })
+                        }
+                    }
+                }
+                // The credential no longer works; stop re-sending it AND stop
+                // re-reading it out of the keychain on the next query.
+                *lock(&state.token) = None;
+                *lock(&state.rejected) = Some(token.access.clone());
+                let detail = resp.into_string().unwrap_or_default();
+                json!({ "ok": false, "error": "not_authenticated", "detail": detail, "status": 401 })
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                json!({ "ok": false, "error": format!("HTTP {code}"), "detail": body, "status": code })
+            }
+            Err(e) => json!({ "ok": false, "error": e.to_string(), "status": 0 }),
+        };
     }
 }
 
@@ -237,63 +402,19 @@ async fn validate_token(state: tauri::State<'_, AppState>, token: String) -> Res
 /// transport and auth failures. A 401 is normalised to `not_authenticated` so
 /// the frontend can route to the sign-in screen instead of showing a raw body.
 ///
-/// `async` matters: a synchronous command runs on the UI thread, so a fleet
-/// sweep would freeze the window for the whole run.
+/// `async` + `spawn_blocking` matter: a synchronous command runs on the UI
+/// thread, so a fleet sweep would freeze the window for the whole run.
 #[tauri::command]
 async fn github_graphql(
     app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
     query: String,
     variables: Option<Value>,
 ) -> Result<Value, String> {
-    let token = match resolve_token(&app, &state) {
-        Ok(Some(t)) => t,
-        Ok(None) => return Ok(json!({ "ok": false, "error": "not_authenticated", "status": 0 })),
-        Err(e) => {
-            return Ok(json!({ "ok": false, "error": "keychain_unavailable", "detail": e, "status": 0 }))
-        }
-    };
-
-    let agent = state.agent.clone();
     let payload = json!({ "query": query, "variables": variables.unwrap_or(json!({})) });
-    let sent = token.clone();
-
-    // Boxed: `ureq::Error` is ~272 bytes and would otherwise bloat every
-    // Result this closure returns.
-    let response = tauri::async_runtime::spawn_blocking(move || {
-        agent
-            .post("https://api.github.com/graphql")
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("Accept", "application/vnd.github+json")
-            .set("X-GitHub-Api-Version", "2022-11-28")
-            .send_json(payload)
-            .map_err(Box::new)
-    })
-    .await
-    .map_err(|e| format!("request task failed: {e}"))?;
-
-    Ok(match response.map_err(|e| *e) {
-        Ok(resp) => {
-            let status = resp.status();
-            match resp.into_json::<Value>() {
-                Ok(body) => json!({ "ok": true, "status": status, "data": body }),
-                Err(e) => json!({ "ok": false, "error": e.to_string(), "status": status }),
-            }
-        }
-        Err(ureq::Error::Status(401, resp)) => {
-            // The stored token no longer works; stop re-sending it AND stop
-            // re-reading it out of the keychain on the next query.
-            *lock(&state.token) = None;
-            *lock(&state.rejected) = Some(sent);
-            let detail = resp.into_string().unwrap_or_default();
-            json!({ "ok": false, "error": "not_authenticated", "detail": detail, "status": 401 })
-        }
-        Err(ureq::Error::Status(code, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
-            json!({ "ok": false, "error": format!("HTTP {code}"), "detail": body, "status": code })
-        }
-        Err(e) => json!({ "ok": false, "error": e.to_string(), "status": 0 }),
-    })
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || execute_graphql(&handle, payload))
+        .await
+        .map_err(|e| format!("request task failed: {e}"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -315,6 +436,8 @@ pub fn run() {
         .manage(AppState {
             token: Mutex::new(None),
             rejected: Mutex::new(None),
+            refresh_gate: Mutex::new(()),
+            login_cancel: Mutex::new(None),
             agent: ureq::AgentBuilder::new()
                 .user_agent(concat!("repo-crew/", env!("CARGO_PKG_VERSION")))
                 .timeout_connect(CONNECT_TIMEOUT)
@@ -333,11 +456,12 @@ pub fn run() {
         })
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            set_token,
             clear_token,
             has_token,
-            validate_token,
-            github_graphql
+            github_graphql,
+            oauth::oauth_config,
+            oauth::start_github_login,
+            oauth::cancel_github_login
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -347,39 +471,24 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    fn state() -> AppState {
-        AppState {
-            token: Mutex::new(None),
-            rejected: Mutex::new(None),
-            agent: ureq::AgentBuilder::new().build(),
-        }
+    fn bare(access: &str) -> StoredToken {
+        StoredToken { access: access.into(), refresh: None, expires_at: None }
     }
 
     #[test]
     fn lock_survives_a_poisoned_mutex() {
-        let s = state();
-        *lock(&s.token) = Some("gho_before".into());
+        let m: Mutex<Option<StoredToken>> = Mutex::new(Some(bare("gho_before")));
 
         // Poison the mutex by panicking while the guard is held.
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = s.token.lock().unwrap();
+            let _guard = m.lock().unwrap();
             panic!("boom");
         }));
         assert!(poisoned.is_err());
-        assert!(s.token.is_poisoned());
+        assert!(m.is_poisoned());
 
         // The token path must still be usable rather than panicking.
-        assert_eq!(lock(&s.token).clone(), Some("gho_before".to_string()));
-    }
-
-    #[test]
-    fn cache_round_trips_through_lock() {
-        let s = state();
-        assert_eq!(lock(&s.token).clone(), None);
-        *lock(&s.token) = Some("gho_x".into());
-        assert_eq!(lock(&s.token).clone(), Some("gho_x".to_string()));
-        *lock(&s.token) = None;
-        assert_eq!(lock(&s.token).clone(), None);
+        assert_eq!(lock(&m).clone(), Some(bare("gho_before")));
     }
 
     #[test]
@@ -392,32 +501,52 @@ mod tests {
     }
 
     #[test]
-    fn pick_token_prefers_the_cache() {
-        assert_eq!(
-            pick_token(Some("gho_cached".into()), Some("gho_stored".into()), None),
-            Some("gho_cached".to_string())
-        );
+    fn parse_stored_round_trips_the_json_shape() {
+        let token = StoredToken {
+            access: "ghu_a".into(),
+            refresh: Some("ghr_b".into()),
+            expires_at: Some(1_755_000_000),
+        };
+        let raw = serde_json::to_string(&token).unwrap();
+        assert_eq!(parse_stored(&raw), Some(token));
     }
 
     #[test]
-    fn pick_token_never_returns_a_rejected_token() {
+    fn parse_stored_accepts_a_pre_oauth_bare_token() {
+        // Migration: existing installs stored the PAT as a plain string.
+        assert_eq!(parse_stored("  ghp_legacy  "), Some(bare("ghp_legacy")));
+    }
+
+    #[test]
+    fn parse_stored_rejects_garbage() {
+        assert_eq!(parse_stored(""), None);
+        assert_eq!(parse_stored("   "), None);
+        assert_eq!(parse_stored("two words"), None);
+        // Valid JSON, malformed access token inside.
+        assert_eq!(parse_stored(r#"{"access":"bad token"}"#), None);
+    }
+
+    #[test]
+    fn pick_stored_prefers_the_cache_and_skips_rejected() {
+        assert_eq!(
+            pick_stored(Some(bare("gho_cached")), Some("gho_stored".into()), None),
+            Some(bare("gho_cached"))
+        );
         // The 401 loop this breaks: cache cleared, keychain still holds the
         // dead token, and without the filter it would be re-sent forever.
-        assert_eq!(pick_token(None, Some("gho_dead".into()), Some("gho_dead")), None);
-        // A different stored token IS eligible again.
+        assert_eq!(pick_stored(None, Some("gho_dead".into()), Some("gho_dead")), None);
         assert_eq!(
-            pick_token(None, Some("gho_new".into()), Some("gho_dead")),
-            Some("gho_new".to_string())
+            pick_stored(None, Some("gho_new".into()), Some("gho_dead")),
+            Some(bare("gho_new"))
         );
     }
 
     #[test]
-    fn pick_token_skips_blank_and_malformed_values() {
-        assert_eq!(pick_token(Some("  ".into()), Some("\n".into()), None), None);
-        // A control byte would corrupt the Authorization header.
-        assert_eq!(pick_token(None, Some("gho_a\u{7f}b".into()), None), None);
-        // Whitespace is trimmed, not fatal.
-        assert_eq!(pick_token(None, Some("  gho_ok  ".into()), None), Some("gho_ok".to_string()));
+    fn needs_refresh_fires_a_minute_early_and_never_for_long_lived_tokens() {
+        assert!(!needs_refresh(None, u64::MAX));
+        assert!(!needs_refresh(Some(1_000), 900));
+        assert!(needs_refresh(Some(1_000), 940)); // within the 60 s skew
+        assert!(needs_refresh(Some(1_000), 1_001)); // already dead
     }
 
     #[test]

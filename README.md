@@ -14,10 +14,42 @@ pnpm install
 pnpm tauri dev
 ```
 
-The GitHub token is stored in the OS keychain (Secret Service on Linux —
-`gnome-keyring`, KWallet, or KeePassXC must be running), never on disk. The
-webview never sees it: the Rust side holds the credential and proxies the
-GraphQL calls.
+Sign-in credentials come from a gitignored `.env` at the repo root, which
+`src-tauri/build.rs` forwards into the compile (real environment variables
+take precedence, so CI/makepkg can override it):
+
+```sh
+REPO_CREW_GH_CLIENT_ID=…      # GitHub App client id
+REPO_CREW_GH_CLIENT_SECRET=…  # GitHub App client secret
+REPO_CREW_GH_APP_SLUG=…       # app slug, for the install-page links
+```
+
+## Sign-in (GitHub App)
+
+Sign-in is a browser OAuth flow against a GitHub App — the loopback pattern:
+the app listens once on `http://127.0.0.1:43117/callback`, opens
+github.com/login/oauth/authorize, and exchanges the redirect code for a
+user-to-server token. Organisation SSO happens in the browser like any other
+GitHub sign-in. The resulting credential (access token, plus refresh token
+when the app has user-token expiry enabled) is stored in the OS keychain
+(Secret Service on Linux — `gnome-keyring`, KWallet, or KeePassXC must be
+running), never on disk. The webview never sees any secret: the Rust side
+owns the code exchange, the keychain, and the GraphQL proxy, and refreshes
+expiring tokens automatically.
+
+The three `REPO_CREW_GH_*` values are compiled in via `option_env!` and are
+deliberately not in this repository. A build without them runs, but the
+sign-in screen reports itself unconfigured. The GitHub App needs:
+
+- Callback URL `http://127.0.0.1:43117/callback`, webhook disabled
+- Repository permissions: Contents RW, Pull requests RW, Issues RW,
+  Metadata RO
+
+There is **no app private key** in the binary, ever — user sign-in does not
+use one, and shipping it would hand out installation tokens for every install
+of the app. Note that a user token only sees repositories where the app is
+installed, so a fresh sign-in starts from an empty fleet until the app is
+installed on your account.
 
 ## The five gates
 

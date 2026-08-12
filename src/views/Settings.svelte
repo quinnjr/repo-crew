@@ -1,37 +1,42 @@
 <script lang="ts">
+  import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { authenticated, prefs, theme, toast, viewer } from '../lib/stores'
-  import { fetchViewer } from '../lib/graphql'
+  import { cancelSignIn, installUrl, oauthConfig, signInWithGitHub, SignInCancelled, type OauthConfig } from '../lib/auth'
   import Header from '../components/Header.svelte'
+  import LoginLink from '../components/LoginLink.svelte'
   import type { MergeMethod } from '../lib/types'
   import type { Theme } from '../lib/stores'
 
-  let token = $state('')
-  let saving = $state(false)
+  let signingIn = $state(false)
+  let loginUrl = $state('')
+  let cfg = $state<OauthConfig>({ configured: true, slug: null })
 
-  // The replacement is vetted with GitHub BEFORE it overwrites the stored
-  // token. Storing first and rolling back on failure — the old flow — meant
-  // destroying a working credential in order to test a broken one.
-  const saveToken = async () => {
-    const value = token.trim()
-    if (!value) return
-    saving = true
+  onMount(() => {
+    oauthConfig()
+      .then((c) => (cfg = c))
+      .catch(() => {})
+    return () => {
+      if (signingIn) void cancelSignIn()
+    }
+  })
+
+  // Re-running the browser flow replaces the stored credential — the way to
+  // switch accounts or recover from a revoked authorization.
+  const signIn = async () => {
+    if (signingIn) return
+    signingIn = true
     try {
-      await invoke<string>('validate_token', { token: value })
-      await invoke('set_token', { token: value })
-      const me = await fetchViewer()
-      if (me) viewer.set(me)
-      authenticated.set(true)
-      token = ''
-      toast('Token saved', { kind: 'success' })
+      await signInWithGitHub((url) => (loginUrl = url))
+      toast(`Signed in as ${$viewer?.login ?? 'GitHub user'}`, { kind: 'success' })
     } catch (e) {
-      toast(`That token was not kept: ${e instanceof Error ? e.message : e}`, {
-        kind: 'error',
-        sticky: true,
-      })
+      if (!(e instanceof SignInCancelled)) {
+        toast(`Could not sign in: ${e instanceof Error ? e.message : e}`, { kind: 'error', sticky: true })
+      }
     } finally {
-      saving = false
+      signingIn = false
+      loginUrl = ''
     }
   }
 
@@ -87,35 +92,37 @@
       {:else}
         <p class="font-sans text-[13px] text-ink-3">Not connected.</p>
       {/if}
-    </section>
-
-    <section class="mt-4 rounded-sm border border-line bg-panel p-5">
-      <h2 class="engraved mb-3">Token</h2>
-      <label class="block">
-        <span class="sr-only">GitHub token</span>
-        <input
-          type="password"
-          bind:value={token}
-          placeholder={$authenticated ? 'Replace the stored token' : 'Paste a GitHub token'}
-          class="w-full rounded-sm border border-line-strong bg-field px-3 py-2 text-[12px] text-ink placeholder:text-ink-3 focus:border-brass focus:outline-none"
-        />
-      </label>
-      <div class="mt-3 flex flex-wrap items-center gap-2">
+      <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-line pt-4">
         <button
-          onclick={saveToken}
-          disabled={saving || !token.trim()}
+          onclick={signIn}
+          disabled={signingIn || !cfg.configured}
           class="rounded-sm border border-brass/60 bg-brass/15 px-3 py-1.5 text-[11px] text-brass transition-colors hover:bg-brass/25 disabled:cursor-not-allowed disabled:opacity-40"
-        >{saving ? 'Saving…' : 'Save token'}</button>
-        <button
-          onclick={() => openUrl('https://github.com/settings/personal-access-tokens')}
-          class="ml-auto rounded-sm border border-line-strong px-3 py-1.5 text-[11px] text-ink-2 transition-colors hover:bg-hover hover:text-ink"
         >
-          <i class="fa-solid fa-up-right-from-square text-[10px]"></i> Manage tokens on GitHub
+          <i class="fa-brands fa-github text-[11px]"></i>
+          {signingIn ? 'Waiting for the browser…' : $viewer ? 'Sign in again' : 'Sign in with GitHub'}
         </button>
+        {#if signingIn}
+          <button
+            onclick={() => void cancelSignIn()}
+            class="rounded-sm px-3 py-1.5 text-[11px] text-ink-3 transition-colors hover:text-ink"
+          >Cancel</button>
+        {/if}
+        {#if signingIn && loginUrl}
+          <LoginLink url={loginUrl} />
+        {/if}
+        {#if cfg.slug}
+          <button
+            onclick={() => cfg.slug && openUrl(installUrl(cfg.slug))}
+            class="ml-auto rounded-sm border border-line-strong px-3 py-1.5 text-[11px] text-ink-2 transition-colors hover:bg-hover hover:text-ink"
+          >
+            <i class="fa-solid fa-up-right-from-square text-[10px]"></i> Manage app installation
+          </button>
+        {/if}
       </div>
       <p class="mt-3 font-sans text-[11px] leading-relaxed text-ink-3">
-        Stored in your system keychain, never written to disk in plain text, and never sent anywhere
-        except api.github.com.
+        Sign-in happens in your browser; the resulting credential lives in your system keychain,
+        is never written to disk in plain text, and is never sent anywhere except github.com and
+        api.github.com. The app only sees repositories where it is installed.
       </p>
     </section>
 

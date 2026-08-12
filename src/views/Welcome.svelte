@@ -1,42 +1,46 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core'
+  import { onMount } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { authenticated, toast, viewer } from '../lib/stores'
-  import { fetchViewer } from '../lib/graphql'
+  import { toast } from '../lib/stores'
+  import { cancelSignIn, installUrl, oauthConfig, signInWithGitHub, SignInCancelled, type OauthConfig } from '../lib/auth'
   import Spinner from '../components/Spinner.svelte'
+  import LoginLink from '../components/LoginLink.svelte'
 
-  let token = $state('')
-  let reveal = $state(false)
-  let connecting = $state(false)
+  let waiting = $state(false)
+  let loginUrl = $state('')
+  // Optimistic: assume a configured build until the backend says otherwise,
+  // so the button does not flash in and out on every launch.
+  let cfg = $state<OauthConfig>({ configured: true, slug: null })
 
-  // Vetted with GitHub before it is stored, so a typo'd paste never becomes
-  // a saved credential the user has to hunt down and clear.
-  const connect = async () => {
-    const value = token.trim()
-    if (!value) return
-    connecting = true
-    try {
-      await invoke<string>('validate_token', { token: value })
-      await invoke('set_token', { token: value })
-      const me = await fetchViewer()
-      if (!me) throw new Error('the token was accepted but returned no account')
-      viewer.set(me)
-      authenticated.set(true)
-    } catch (e) {
-      // Roll back so a half-connected state cannot survive: if the clear
-      // itself fails, say so rather than claiming the token was discarded.
-      const rolledBack = await invoke('clear_token').then(
-        () => true,
-        () => false,
-      )
-      const kept = rolledBack ? 'it was not kept' : 'and it could not be cleared — remove it in Settings'
-      toast(`Could not connect, ${kept}: ${e instanceof Error ? e.message : e}`, {
-        kind: 'error',
-        sticky: true,
-      })
-    } finally {
-      connecting = false
+  onMount(() => {
+    oauthConfig()
+      .then((c) => (cfg = c))
+      .catch(() => {})
+    return () => {
+      // Leaving the screen abandons the flow — nothing else could report it.
+      if (waiting) void cancelSignIn()
     }
+  })
+
+  const connect = async () => {
+    // Re-entry guard: a duplicate click would start a second flow, silently
+    // cancel the first, and strand its never-settling promise.
+    if (waiting) return
+    waiting = true
+    try {
+      await signInWithGitHub((url) => (loginUrl = url))
+    } catch (e) {
+      if (!(e instanceof SignInCancelled)) {
+        toast(`Could not sign in: ${e instanceof Error ? e.message : e}`, { kind: 'error', sticky: true })
+      }
+    } finally {
+      waiting = false
+      loginUrl = ''
+    }
+  }
+
+  const cancel = () => {
+    void cancelSignIn()
   }
 </script>
 
@@ -72,42 +76,54 @@
     </div>
 
     <div class="rounded-sm border border-line bg-panel p-5">
-      <label class="engraved mb-2 block" for="token">GitHub token</label>
-      <div class="relative">
-        <input
-          id="token"
-          bind:value={token}
-          type={reveal ? 'text' : 'password'}
-          placeholder="github_pat_… or ghp_…"
-          onkeydown={(e) => e.key === 'Enter' && connect()}
-          class="w-full rounded-sm border border-line-strong bg-field px-3 py-2.5 pr-10 text-[12px] text-ink placeholder:text-ink-3 focus:border-brass focus:outline-none"
-        />
+      {#if !cfg.configured}
+        <p class="font-sans text-[13px] leading-relaxed text-ink-2">
+          This build has no sign-in credentials.
+        </p>
+        <p class="mt-2 font-sans text-[11px] leading-relaxed text-ink-3">
+          It was compiled without <span class="font-mono text-ink-2">REPO_CREW_GH_CLIENT_ID</span> and
+          <span class="font-mono text-ink-2">REPO_CREW_GH_CLIENT_SECRET</span>, so it cannot start the
+          GitHub sign-in. Rebuild with both set.
+        </p>
+      {:else if waiting}
+        <div class="flex items-center gap-3">
+          <Spinner label="Waiting for your browser…" />
+          <button
+            onclick={cancel}
+            class="ml-auto rounded-sm px-3 py-1.5 text-[11px] text-ink-3 transition-colors hover:text-ink"
+          >Cancel</button>
+        </div>
+        <p class="mt-3 font-sans text-[11px] leading-relaxed text-ink-3">
+          Finish signing in with GitHub in the browser window that just opened. Organisation SSO
+          happens there too, if your org requires it.
+        </p>
+        {#if loginUrl}
+          <div class="mt-3 border-t border-line pt-3">
+            <p class="engraved mb-2">Browser didn't open?</p>
+            <LoginLink url={loginUrl} />
+            <p class="mt-2 font-sans text-[11px] leading-relaxed text-ink-3">
+              Paste it into any browser on this machine — the sign-in returns to this app through
+              127.0.0.1.
+            </p>
+          </div>
+        {/if}
+      {:else}
         <button
-          onclick={() => (reveal = !reveal)}
-          aria-label={reveal ? 'Hide token' : 'Show token'}
-          class="absolute right-2.5 top-1/2 -translate-y-1/2 text-ink-3 transition-colors hover:text-ink"
+          onclick={connect}
+          class="flex w-full items-center justify-center gap-2 rounded-sm border border-brass/60 bg-brass/15 py-2.5 text-[12px] text-brass transition-colors hover:bg-brass/25"
         >
-          <i class="fa-solid {reveal ? 'fa-eye-slash' : 'fa-eye'} text-[11px]"></i>
+          <i class="fa-brands fa-github text-[13px]"></i>
+          Sign in with GitHub
         </button>
-      </div>
-
-      <button
-        onclick={connect}
-        disabled={connecting || !token.trim()}
-        class="mt-3 flex w-full items-center justify-center gap-2 rounded-sm border border-brass/60 bg-brass/15 py-2.5 text-[12px] text-brass transition-colors hover:bg-brass/25 disabled:cursor-not-allowed disabled:opacity-40"
-      >
-        {#if connecting}<Spinner />{/if}
-        {connecting ? 'Connecting…' : 'Connect'}
-      </button>
-
-      <p class="mt-3 font-sans text-[11px] leading-relaxed text-ink-3">
-        A fine-grained token needs read and write on Issues and Pull requests; a classic token needs the
-        <span class="font-mono text-ink-2">repo</span> scope.
-        <button
-          onclick={() => openUrl('https://github.com/settings/personal-access-tokens/new')}
-          class="text-brass underline underline-offset-2 hover:text-brass-hi"
-        >Create one on GitHub</button>.
-      </p>
+        <p class="mt-3 font-sans text-[11px] leading-relaxed text-ink-3">
+          Opens github.com in your browser; the app never sees your password. It can only reach
+          repositories where it is installed{#if cfg.slug}
+            — <button
+              onclick={() => cfg.slug && openUrl(installUrl(cfg.slug))}
+              class="text-brass underline underline-offset-2 hover:text-brass-hi"
+            >install it on your account</button>{/if}.
+        </p>
+      {/if}
     </div>
   </div>
 </div>

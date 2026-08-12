@@ -135,7 +135,7 @@
     <EmptyState
       icon="fa-solid fa-mug-hot"
       title="Nothing waiting"
-      body="No open dependency updates and no open issues across the {$selectedRepos.length} repos in scope."
+      body="No open dependency updates and no open issues across the {$selectedRepos.length} repos in scope. If the fleet itself looks empty, the GitHub App may not be installed on your account yet — check Fleet."
       action={{ label: 'Widen the scope', onclick: () => goTo('fleet') }}
     />
   {:else}
