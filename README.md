@@ -69,6 +69,20 @@ pnpm lint:rust    # cargo clippy -D warnings
   TypeScript 7. Do not let an upgrade sweep move it.
 - **webkit2gtk 4.1**, not 4.0 — Tauri v2 switched; packaging deps reflect it.
 
+## Branching
+
+git-flow (AVH), initialised with the stock layout: `main` carries releases
+only, `develop` (the GitHub default branch) is the integration line, and work
+happens on `feature/*` / `bugfix/*` branches cut from `develop`. Releases go
+through `release/*` and land on `main` with a `v`-prefixed tag (`v0.2.0`);
+urgent fixes to a released version go through `hotfix/*` off `main`.
+
+```sh
+git flow feature start <name>    # branch off develop
+git flow feature finish <name>   # merge back into develop
+git flow release start 0.2.0     # stabilise; finish tags v0.2.0 on main
+```
+
 ## Packaging
 
 `packaging/arch/PKGBUILD` builds from committed state via `git+file://` — it
