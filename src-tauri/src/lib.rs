@@ -298,6 +298,19 @@ async fn github_graphql(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // webkit2gtk's DMA-BUF renderer dies with a Wayland protocol error
+    // (Gdk "Error 71") under the proprietary NVIDIA driver, killing the
+    // window at startup. Disable it only for that combination — and only
+    // when the user has not set the variable themselves — so every other
+    // GPU keeps the accelerated path.
+    #[cfg(target_os = "linux")]
+    if std::path::Path::new("/proc/driver/nvidia").exists()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
+    {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     tauri::Builder::default()
         .manage(AppState {
             token: Mutex::new(None),
