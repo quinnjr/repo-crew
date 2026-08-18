@@ -1,7 +1,7 @@
 <script lang="ts">
   import Lamps from './Lamps.svelte'
   import Signal from './Signal.svelte'
-  import { bumpOf, checksInfo, mergeInfo } from '../lib/util'
+  import { bumpOf, canPokeRebase, checksInfo, mergeInfo } from '../lib/util'
   import type { PullRequest } from '../lib/types'
 
   let {
@@ -11,6 +11,8 @@
     onOpen,
     showRepo = true,
     lampWidth,
+    onPoke,
+    poking = false,
   }: {
     pr: PullRequest
     selected: boolean
@@ -19,6 +21,9 @@
     showRepo?: boolean
     /** Set by the list so every row reserves the same number of cells. */
     lampWidth: number
+    /** When set, BEHIND/DIRTY rows offer a "poke Dependabot to rebase" button. */
+    onPoke?: () => void
+    poking?: boolean
   } = $props()
 
   const bump = $derived(bumpOf(pr))
@@ -67,6 +72,14 @@
   </button>
 
   <div class="flex shrink-0 items-center gap-4">
+    {#if onPoke && canPokeRebase(pr)}
+      <button
+        onclick={onPoke}
+        disabled={poking}
+        title="Comment “@dependabot rebase” on this pull request"
+        class="rounded-sm border border-line-strong px-2 py-0.5 text-[10px] text-ink-3 transition-colors hover:border-brass/60 hover:text-brass disabled:cursor-not-allowed disabled:opacity-40"
+      >{poking ? 'Poking…' : 'Rebase'}</button>
+    {/if}
     <Lamps checks={pr.checks} width={lampWidth} />
     <span class="hidden w-16 text-right text-[11px] text-ink-3 sm:block">{checks.text}</span>
     <span class="w-20"><Signal signal={merge.signal} text={merge.text} /></span>

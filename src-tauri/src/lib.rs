@@ -423,7 +423,55 @@ fn has_token(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result
 /// The blocking body of `github_graphql`: resolve (refreshing an expired
 /// token proactively), send, and on an unexpected 401 refresh-and-retry once
 /// before declaring the session dead.
+/// One path segment of a `/repos/{owner}/{repo}` URL. Charset-checking is not
+/// enough: "." and ".." pass it but walk the path to a different endpoint.
+fn valid_repo_segment(s: &str) -> bool {
+    s != "."
+        && s != ".."
+        && !s.is_empty()
+        && s.len() <= 100
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// Collapse the `{ ok, error?, detail? }` envelope into the Result shape a
+/// command that returns no data wants to hand the webview.
+fn envelope_to_result(v: &Value) -> Result<(), String> {
+    if v.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let error = v.get("error").and_then(Value::as_str).unwrap_or("request failed");
+    match v.get("detail").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+        Some(detail) => Err(format!("{error}: {detail}")),
+        None => Err(error.to_string()),
+    }
+}
+
+// ureq::Error is what the transport hands back; boxing it would only
+// complicate the 401 match in execute_authorized.
+#[allow(clippy::result_large_err)]
 fn execute_graphql(app: &tauri::AppHandle, payload: Value) -> Value {
+    execute_authorized(app, move |agent, access| {
+        agent
+            .post("https://api.github.com/graphql")
+            .set("Authorization", &format!("Bearer {access}"))
+            .set("Accept", "application/vnd.github+json")
+            .set("X-GitHub-Api-Version", "2022-11-28")
+            // By reference: cloning the whole query tree on every send would
+            // tax each of the many calls in a sweep for the sake of the rare
+            // once-per-8-hours retry.
+            .send_json(&payload)
+    })
+}
+
+/// The token dance shared by every authenticated GitHub call — resolve from
+/// the keychain, refresh proactively, send via `send`, and spend one refresh
+/// on a mid-session 401 — factored out of `execute_graphql` so REST commands
+/// (repository settings live only on the REST API) get identical handling.
+fn execute_authorized(
+    app: &tauri::AppHandle,
+    send: impl Fn(&ureq::Agent, &str) -> Result<ureq::Response, ureq::Error>,
+) -> Value {
     let state = app.state::<AppState>();
 
     let mut token = match resolve_token(app, &state) {
@@ -464,16 +512,7 @@ fn execute_graphql(app: &tauri::AppHandle, payload: Value) -> Value {
         };
     }
     loop {
-        let response = state
-            .agent
-            .post("https://api.github.com/graphql")
-            .set("Authorization", &format!("Bearer {}", token.access))
-            .set("Accept", "application/vnd.github+json")
-            .set("X-GitHub-Api-Version", "2022-11-28")
-            // By reference: cloning the whole query tree on every send would
-            // tax each of the many calls in a sweep for the sake of the rare
-            // once-per-8-hours retry below.
-            .send_json(&payload);
+        let response = send(&state.agent, &token.access);
 
         return match response {
             Ok(resp) => {
@@ -554,6 +593,40 @@ async fn github_graphql(
         .map_err(|e| format!("request task failed: {e}"))
 }
 
+/// Flip a repository's "Allow auto-merge" setting.
+///
+/// REST, not GraphQL: `UpdateRepositoryInput` carries no auto-merge field, so
+/// `PATCH /repos/{owner}/{repo}` is the only API that can change it. Scoped to
+/// this one setting rather than exposing a generic REST proxy to the webview.
+#[allow(clippy::result_large_err)] // see execute_graphql
+#[tauri::command]
+async fn set_repo_auto_merge(
+    app: tauri::AppHandle,
+    owner: String,
+    repo: String,
+    allow: bool,
+) -> Result<(), String> {
+    if !valid_repo_segment(&owner) || !valid_repo_segment(&repo) {
+        return Err(format!("invalid repository name: {owner}/{repo}"));
+    }
+    let handle = app.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let url = format!("https://api.github.com/repos/{owner}/{repo}");
+        let body = json!({ "allow_auto_merge": allow });
+        execute_authorized(&handle, move |agent, access| {
+            agent
+                .request("PATCH", &url)
+                .set("Authorization", &format!("Bearer {access}"))
+                .set("Accept", "application/vnd.github+json")
+                .set("X-GitHub-Api-Version", "2022-11-28")
+                .send_json(&body)
+        })
+    })
+    .await
+    .map_err(|e| format!("request task failed: {e}"))?;
+    envelope_to_result(&outcome)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // webkit2gtk's DMA-BUF renderer dies with a Wayland protocol error
@@ -597,6 +670,7 @@ pub fn run() {
             clear_token,
             has_token,
             github_graphql,
+            set_repo_auto_merge,
             oauth::oauth_config,
             oauth::start_github_login,
             oauth::cancel_github_login
@@ -611,6 +685,32 @@ mod tests {
 
     fn bare(access: &str) -> StoredToken {
         StoredToken { access: access.into(), refresh: None, expires_at: None }
+    }
+
+    #[test]
+    fn repo_segments_reject_path_metacharacters() {
+        assert!(valid_repo_segment("repo-crew"));
+        assert!(valid_repo_segment("a.b_c"));
+        assert!(!valid_repo_segment(""));
+        assert!(!valid_repo_segment("a/b"));
+        assert!(!valid_repo_segment("a b"));
+        // "." and ".." are charset-clean but would walk the URL path.
+        assert!(!valid_repo_segment("."));
+        assert!(!valid_repo_segment(".."));
+    }
+
+    #[test]
+    fn envelope_conversion_carries_error_and_detail() {
+        assert!(envelope_to_result(&json!({ "ok": true, "status": 200 })).is_ok());
+        assert_eq!(
+            envelope_to_result(&json!({ "ok": false, "error": "HTTP 403", "detail": "forbidden" }))
+                .unwrap_err(),
+            "HTTP 403: forbidden"
+        );
+        assert_eq!(
+            envelope_to_result(&json!({ "ok": false, "error": "not_authenticated" })).unwrap_err(),
+            "not_authenticated"
+        );
     }
 
     #[test]

@@ -2,7 +2,8 @@
   import { onMount } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { allRepos, allReposLoaded, selectedRepos, selectedRepoSet, toggleRepo, viewer, toast } from '../lib/stores'
-  import { loadRepos } from '../lib/api'
+  import { loadRepos, noteRepoAutoMerge } from '../lib/api'
+  import { setRepoAutoMerge } from '../lib/graphql'
   import { INSTALLATIONS_URL, installUrl, oauthConfig, type OauthConfig } from '../lib/auth'
   import { ago, pluralise } from '../lib/util'
   import Header from '../components/Header.svelte'
@@ -76,6 +77,23 @@
   })
 
   const allShown = $derived(filtered.length > 0 && filtered.every((r) => $selectedRepoSet.has(r.nameWithOwner)))
+
+  /** Repos whose auto-merge PATCH is in flight, so the button can't double-fire. */
+  let enabling = $state<Set<string>>(new Set())
+
+  const enableRepoAutoMerge = async (name: string) => {
+    if (enabling.has(name)) return
+    enabling = new Set(enabling).add(name)
+    try {
+      await setRepoAutoMerge(name, true)
+      noteRepoAutoMerge(name, true)
+      toast(`Auto-merge enabled on ${name}`, { kind: 'success' })
+    } catch (e) {
+      toast(`Could not enable auto-merge on ${name}: ${e instanceof Error ? e.message : e}`, { kind: 'error' })
+    } finally {
+      enabling = new Set([...enabling].filter((n) => n !== name))
+    }
+  }
 
   const toggleAll = () => {
     const names = new Set($selectedRepos)
@@ -185,6 +203,16 @@
             {/if}
           </span>
           <span class="hidden shrink-0 items-center gap-4 text-[11px] text-ink-3 sm:flex">
+            {#if !repo.autoMergeAllowed && !repo.isArchived}
+              <!-- preventDefault: the row is a <label>, and a plain click on
+                   anything inside it would also toggle the scope checkbox. -->
+              <button
+                onclick={(e) => { e.preventDefault(); e.stopPropagation(); enableRepoAutoMerge(repo.nameWithOwner) }}
+                disabled={enabling.has(repo.nameWithOwner)}
+                title="This repository does not allow auto-merge, so “Merge when checks pass” fails here. Turns on the repository setting."
+                class="rounded-sm border border-line-strong px-2 py-0.5 text-[10px] transition-colors hover:border-brass/60 hover:text-brass disabled:cursor-not-allowed disabled:opacity-40"
+              >{enabling.has(repo.nameWithOwner) ? 'Enabling…' : 'Enable auto-merge'}</button>
+            {/if}
             {#if repo.primaryLanguage}<span>{repo.primaryLanguage.name}</span>{/if}
             <span class="w-10 text-right">{ago(repo.updatedAt)}</span>
           </span>

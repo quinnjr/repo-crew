@@ -18,6 +18,8 @@ export type Repo = {
   updatedAt: string
   pushedAt: string | null
   defaultBranchRef: { name: string } | null
+  /** The repository-level "Allow auto-merge" setting. */
+  autoMergeAllowed: boolean
 }
 
 export type MergeStateStatus =

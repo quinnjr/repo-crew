@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
-import { loadDependabot, loadIssues, loadRepos, refreshAtLaunch, scopeFallback } from './api'
+import { loadDependabot, loadIssues, loadRepos, noteRepoAutoMerge, refreshAtLaunch, scopeFallback } from './api'
 import {
   allRepos,
   allReposLoaded,
@@ -185,5 +185,20 @@ describe('cache writes', () => {
     await expect(refreshAtLaunch()).resolves.toBeUndefined()
     expect(get(dependabotPRs)).toEqual([stale])
     expect(get(dependabotLoaded)).toBe(true)
+  })
+})
+
+describe('noteRepoAutoMerge', () => {
+  it('updates the store entry and rewrites the fleet cache', () => {
+    installFakeStorage()
+    viewer.set({ id: 'U_1', login: 'octocat', name: null, avatarUrl: null })
+    const repo = makeRepo({ autoMergeAllowed: false })
+    allRepos.set([repo])
+    noteRepoAutoMerge(repo.nameWithOwner, true)
+    expect(get(allRepos)[0]?.autoMergeAllowed).toBe(true)
+    expect(readCache(REPOS_CACHE_KEY, 'octocat', asCachedRepos)?.[0]?.autoMergeAllowed).toBe(true)
+    removeFakeStorage()
+    viewer.set(null)
+    allRepos.set([])
   })
 })

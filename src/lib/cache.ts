@@ -11,7 +11,7 @@ import type { Issue, PullRequest, Repo, Viewer } from './types'
  */
 
 /** Bump when a cached shape changes; old entries then read as absent. */
-const CACHE_VERSION = 1
+const CACHE_VERSION = 2 // 2: Repo rows gained autoMergeAllowed
 
 type Entry = { v: number; scope: string; savedAt: number; data: unknown }
 

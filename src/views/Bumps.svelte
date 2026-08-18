@@ -14,8 +14,9 @@
     toast,
   } from '../lib/stores'
   import { loadDependabot, refreshDependabot } from '../lib/api'
+  import { addComment } from '../lib/graphql'
   import { groupRows } from '../lib/ledger'
-  import { checksInfo, mergeInfo, millis, pluralise } from '../lib/util'
+  import { DEPENDABOT_REBASE_COMMENT, checksInfo, mergeInfo, millis, pluralise } from '../lib/util'
   import Header from '../components/Header.svelte'
   import PrRow from '../components/PrRow.svelte'
   import Spinner from '../components/Spinner.svelte'
@@ -25,6 +26,31 @@
   let query = $state('')
   let only = $state<'all' | 'ready' | 'failing' | 'blocked' | 'stale'>('all')
   let selected = $state(new SvelteSet<string>())
+
+  /** PRs whose rebase poke is in flight, so the row button can't double-fire. */
+  const poking = new SvelteSet<string>()
+
+  /**
+   * "@dependabot rebase" as a comment is the whole protocol — the rebase
+   * itself lands asynchronously on GitHub's side, so there is nothing to
+   * refetch here; Dependabot answers on the PR thread.
+   */
+  const poke = async (pr: PullRequest) => {
+    if (poking.has(pr.id)) return
+    poking.add(pr.id)
+    try {
+      await addComment(pr.id, DEPENDABOT_REBASE_COMMENT)
+      toast(`Asked Dependabot to rebase ${pr.repoShort}#${pr.number} — it replies on the pull request`, {
+        kind: 'success',
+      })
+    } catch (e) {
+      toast(`Could not poke ${pr.repoShort}#${pr.number}: ${e instanceof Error ? e.message : e}`, {
+        kind: 'error',
+      })
+    } finally {
+      poking.delete(pr.id)
+    }
+  }
   let error = $state('')
   let errorTitle = $state('')
 
@@ -252,6 +278,8 @@
               onOpen={() => openUrl(pr.url)}
               showRepo={$pivot === 'change'}
               {lampWidth}
+              onPoke={() => poke(pr)}
+              poking={poking.has(pr.id)}
             />
           {/each}
         </section>

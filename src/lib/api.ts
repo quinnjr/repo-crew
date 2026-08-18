@@ -184,6 +184,20 @@ export const refreshIssues = async (): Promise<void> => {
 }
 
 /**
+ * Record a repository's "Allow auto-merge" flip in the store AND the disk
+ * cache — without the cache write, the next launch would hydrate the old
+ * value and re-show an "auto-merge off" indicator that is no longer true.
+ */
+export const noteRepoAutoMerge = (name: string, allow: boolean): void => {
+  allRepos.update((repos) => {
+    const next = repos.map((r) => (r.nameWithOwner === name ? { ...r, autoMergeAllowed: allow } : r))
+    const login = get(viewer)?.login
+    if (login) writeCache(REPOS_CACHE_KEY, login, next)
+    return next
+  })
+}
+
+/**
  * The stale-while-revalidate half of the launch cache: hydration
  * (`hydrateFromCache` in stores.ts) puts the last run's board on screen with
  * `loaded` up, and this refetches everything behind it. Deliberately NOT the

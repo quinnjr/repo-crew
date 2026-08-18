@@ -70,6 +70,7 @@ export const makeRepo = (over: Partial<Repo> = {}): Repo => {
     updatedAt: '2026-08-01T00:00:00Z',
     pushedAt: '2026-08-01T00:00:00Z',
     defaultBranchRef: { name: 'main' },
+    autoMergeAllowed: true,
     ...over,
   }
 }
