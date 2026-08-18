@@ -2,7 +2,7 @@
   import { get } from 'svelte/store'
   import { deleteHeadRef, enableAutoMerge, fetchHeadOids, mergePullRequest } from '../lib/graphql'
   import { prefs, toast } from '../lib/stores'
-  import { bumpOf, mergeInfo, pluralise } from '../lib/util'
+  import { bumpOf, isCleanStatusError, mergeInfo, pluralise } from '../lib/util'
   import Panel from './Panel.svelte'
   import Spinner from './Spinner.svelte'
   import type { MergeMethod, PullRequest } from '../lib/types'
@@ -75,6 +75,23 @@
       }
     }
 
+    /** Direct merge + optional branch deletion; sets the row's result. */
+    const directMerge = async (pr: PullRequest) => {
+      await mergePullRequest(pr.id, { method, expectedHeadOid: oids.get(pr.id) ?? null })
+      if (deleteBranch) {
+        // The merge landed, so a failed deletion must not put this PR in
+        // the retry set — it is reported on the row instead.
+        try {
+          await deleteHeadRef(pr.id)
+          results[pr.id] = { ok: true, msg: 'merged' }
+        } catch {
+          results[pr.id] = { ok: true, msg: 'merged — branch not deleted' }
+        }
+      } else {
+        results[pr.id] = { ok: true, msg: 'merged' }
+      }
+    }
+
     for (const pr of targets) {
       if (cancelling) break
       try {
@@ -84,22 +101,19 @@
           // deleteBranch is not sent: the input type has no such field, and
           // GitHub deletes queued-merge branches only via the repo's own
           // auto-delete setting (see the toggle's hint).
-          await enableAutoMerge(pr.id, { method, expectedHeadOid: oids.get(pr.id) ?? null })
-          results[pr.id] = { ok: true, msg: 'queued' }
-        } else {
-          await mergePullRequest(pr.id, { method, expectedHeadOid: oids.get(pr.id) ?? null })
-          if (deleteBranch) {
-            // The merge landed, so a failed deletion must not put this PR in
-            // the retry set — it is reported on the row instead.
-            try {
-              await deleteHeadRef(pr.id)
-              results[pr.id] = { ok: true, msg: 'merged' }
-            } catch {
-              results[pr.id] = { ok: true, msg: 'merged — branch not deleted' }
-            }
-          } else {
-            results[pr.id] = { ok: true, msg: 'merged' }
+          try {
+            await enableAutoMerge(pr.id, { method, expectedHeadOid: oids.get(pr.id) ?? null })
+            results[pr.id] = { ok: true, msg: 'queued' }
+          } catch (e) {
+            // GitHub refuses to queue a PR whose checks already pass. For
+            // "merge when checks pass" that means: the checks passed — merge
+            // it now. Reactive rather than pre-checked, so a sweep gone
+            // stale in either direction still lands on the right path.
+            if (!isCleanStatusError(e instanceof Error ? e.message : String(e))) throw e
+            await directMerge(pr)
           }
+        } else {
+          await directMerge(pr)
         }
       } catch (e) {
         results[pr.id] = { ok: false, msg: friendly(e instanceof Error ? e.message : String(e)) }
@@ -111,7 +125,11 @@
     if (cancelling) {
       toast(`Stopped after ${pluralise(ok, 'pull request')}`, { kind: 'info' })
     } else if (ok === queue.length) {
-      toast(`${auto ? 'Queued' : 'Merged'} ${pluralise(ok, 'pull request')}`, { kind: 'success' })
+      // An auto run can mix outcomes: already-clean PRs merge directly
+      // instead of queueing, so count what actually happened.
+      const queued = queue.filter((p) => results[p.id]?.msg === 'queued').length
+      const verbPast = queued === 0 ? 'Merged' : queued === ok ? 'Queued' : 'Queued or merged'
+      toast(`${verbPast} ${pluralise(ok, 'pull request')}`, { kind: 'success' })
       onDone()
     } else {
       toast(`${ok} of ${queue.length} went through — retry the rest below`, { kind: 'error', sticky: true })

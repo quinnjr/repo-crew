@@ -269,6 +269,14 @@ export const canPokeRebase = (pr: PrLike): boolean => {
   return state === 'BEHIND' || state === 'DIRTY'
 }
 
+/**
+ * GitHub refuses to enable auto-merge on a PR whose checks already pass —
+ * "Pull request is in clean status" (often with a doubled "Pull request"
+ * prefix, GitHub's own quirk). For "merge when checks pass" that refusal
+ * means: merge it directly instead.
+ */
+export const isCleanStatusError = (msg: string): boolean => /is in clean status/i.test(msg)
+
 /** Roll a PR's checks up into counts and one signal, in a single pass. */
 export const checksInfo = (pr: PrLike): ChecksReadout => {
   const checks = 'checks' in pr && pr.checks ? pr.checks : flattenChecks(pr)

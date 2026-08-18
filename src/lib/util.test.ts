@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ago, bumpOf, checksInfo, flattenChecks, mergeInfo, millis, overallSignal, semverStep, shortRepo, DEPENDABOT_REBASE_COMMENT, canPokeRebase } from './util'
+import { ago, bumpOf, checksInfo, flattenChecks, mergeInfo, millis, overallSignal, semverStep, shortRepo, DEPENDABOT_REBASE_COMMENT, canPokeRebase, isCleanStatusError } from './util'
 import { makePr as pr } from './fixtures'
 import type { Check, MergeStateStatus } from './types'
 
@@ -251,5 +251,14 @@ describe('canPokeRebase', () => {
 describe('DEPENDABOT_REBASE_COMMENT', () => {
   it('is the literal command Dependabot listens for', () => {
     expect(DEPENDABOT_REBASE_COMMENT).toBe('@dependabot rebase')
+  })
+})
+
+describe('isCleanStatusError', () => {
+  it('matches GitHub’s clean-status rejection, doubled prefix and all', () => {
+    expect(isCleanStatusError('Pull request Pull request is in clean status')).toBe(true)
+    expect(isCleanStatusError('["Pull request is in clean status"]')).toBe(true)
+    expect(isCleanStatusError('Pull request is not mergeable')).toBe(false)
+    expect(isCleanStatusError('auto-merge is not allowed')).toBe(false)
   })
 })
