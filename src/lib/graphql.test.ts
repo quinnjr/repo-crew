@@ -4,7 +4,7 @@ import { get } from 'svelte/store'
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }))
 
-import { AuthError, GraphQLError, fetchDependabotPRs, gql } from './graphql'
+import { AuthError, GraphQLError, deleteHeadRef, enableAutoMerge, fetchDependabotPRs, gql } from './graphql'
 import { authenticated } from './stores'
 import { makePr } from './fixtures'
 
@@ -110,5 +110,55 @@ describe('fetchDependabotPRs — partial recovery', () => {
     })
     const res = await fetchDependabotPRs(['acme/busy'])
     expect(res.truncated).toEqual([{ repo: 'acme/busy', kind: 'pullRequests' }])
+  })
+})
+
+describe('enableAutoMerge', () => {
+  // GitHub's EnablePullRequestAutoMergeInput has no deleteBranch field —
+  // sending one fails the whole mutation, so auto-merge never gets enabled.
+  it('sends only fields the input type defines', async () => {
+    invokeMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: { data: { enablePullRequestAutoMerge: { pullRequest: { id: 'PR_1' } } } },
+    })
+    await enableAutoMerge('PR_1', { method: 'SQUASH', expectedHeadOid: 'abc' })
+    const args = invokeMock.mock.calls[0]?.[1] as { variables: { input: Record<string, unknown> } }
+    expect(args.variables.input).toEqual({
+      pullRequestId: 'PR_1',
+      mergeMethod: 'SQUASH',
+      expectedHeadOid: 'abc',
+    })
+  })
+})
+
+describe('deleteHeadRef', () => {
+  it('looks up the head ref id and deletes it', async () => {
+    invokeMock
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        data: { data: { node: { headRef: { id: 'REF_1' } } } },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        data: { data: { deleteRef: { clientMutationId: null } } },
+      })
+    expect(await deleteHeadRef('PR_1')).toBe(true)
+    const second = invokeMock.mock.calls[1]?.[1] as { variables: { input: Record<string, unknown> } }
+    expect(second.variables.input).toEqual({ refId: 'REF_1' })
+  })
+
+  it('reports the ref already gone without attempting a delete', async () => {
+    // The repo's own auto-delete setting often wins the race; that is
+    // success from the user's point of view, not an error.
+    invokeMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      data: { data: { node: { headRef: null } } },
+    })
+    expect(await deleteHeadRef('PR_1')).toBe(false)
+    expect(invokeMock).toHaveBeenCalledTimes(1)
   })
 })

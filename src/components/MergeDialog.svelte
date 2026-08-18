@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get } from 'svelte/store'
-  import { enableAutoMerge, fetchHeadOids, mergePullRequest } from '../lib/graphql'
+  import { deleteHeadRef, enableAutoMerge, fetchHeadOids, mergePullRequest } from '../lib/graphql'
   import { prefs, toast } from '../lib/stores'
   import { bumpOf, mergeInfo, pluralise } from '../lib/util'
   import Panel from './Panel.svelte'
@@ -81,11 +81,25 @@
         // expectedHeadOid matters more on auto-merge, not less: it has the
         // widest window between the sweep and the commit that lands.
         if (auto) {
-          await enableAutoMerge(pr.id, { method, deleteBranch, expectedHeadOid: oids.get(pr.id) ?? null })
+          // deleteBranch is not sent: the input type has no such field, and
+          // GitHub deletes queued-merge branches only via the repo's own
+          // auto-delete setting (see the toggle's hint).
+          await enableAutoMerge(pr.id, { method, expectedHeadOid: oids.get(pr.id) ?? null })
           results[pr.id] = { ok: true, msg: 'queued' }
         } else {
           await mergePullRequest(pr.id, { method, expectedHeadOid: oids.get(pr.id) ?? null })
-          results[pr.id] = { ok: true, msg: 'merged' }
+          if (deleteBranch) {
+            // The merge landed, so a failed deletion must not put this PR in
+            // the retry set — it is reported on the row instead.
+            try {
+              await deleteHeadRef(pr.id)
+              results[pr.id] = { ok: true, msg: 'merged' }
+            } catch {
+              results[pr.id] = { ok: true, msg: 'merged — branch not deleted' }
+            }
+          } else {
+            results[pr.id] = { ok: true, msg: 'merged' }
+          }
         }
       } catch (e) {
         results[pr.id] = { ok: false, msg: friendly(e instanceof Error ? e.message : String(e)) }
@@ -154,7 +168,7 @@
   <div class="mb-4 divide-y divide-line rounded-sm border border-line">
     {#each [
       { get: () => auto, set: (v: boolean) => (auto = v), label: 'Merge when checks pass', hint: 'Hands the merge to GitHub instead of waiting here' },
-      { get: () => deleteBranch, set: (v: boolean) => (deleteBranch = v), label: 'Delete branch after merge', hint: 'Keeps Dependabot branches from piling up' },
+      { get: () => deleteBranch, set: (v: boolean) => (deleteBranch = v), label: 'Delete branch after merge', hint: auto ? 'Queued merges delete only if the repository auto-deletes head branches' : 'Keeps Dependabot branches from piling up' },
     ] as toggle}
       <label class="flex cursor-pointer items-center gap-3 px-3 py-2.5">
         <input
