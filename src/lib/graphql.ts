@@ -183,7 +183,7 @@ type RawPR = Omit<PullRequest, 'repo' | 'repoShort' | 'checks'>
  * `pull-request-branch-name.separator`/prefix will be missed; upgrade to
  * matching on the PR's `app` association if that ever bites.
  */
-export const isDependabotPR = (pr: RawPR): boolean => {
+const isDependabotPR = (pr: RawPR): boolean => {
   const login = pr.author?.login
   if (login === 'dependabot[bot]' || login === 'app/dependabot' || login === 'dependabot') return true
   if (pr.author?.__typename === 'Bot' && login?.startsWith('dependabot')) return true
