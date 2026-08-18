@@ -1,19 +1,28 @@
 import { writable, derived, get } from 'svelte/store'
 import type { Issue, IssueRef, MergeMethod, Prefs, PullRequest, Repo, Toast, ToastKind, ViewId, Viewer } from './types'
+import {
+  DEPENDABOT_CACHE_KEY,
+  ISSUES_CACHE_KEY,
+  REPOS_CACHE_KEY,
+  VIEWER_CACHE_KEY,
+  asCachedDependabot,
+  asCachedIssues,
+  asCachedRepos,
+  asCachedViewer,
+  clearCache,
+  readCache,
+  readRaw,
+  writeCache,
+  writeJSON,
+} from './cache'
 
 const REPOS_KEY = 'repo-crew.selectedRepos'
 const PREFS_KEY = 'repo-crew.prefs'
 const THEME_KEY = 'repo-crew.theme'
 const PIVOT_KEY = 'repo-crew.pivot'
 
-/** Every localStorage touch is guarded — a blocked storage partition must not take the app down. */
-const readRaw = (key: string): string | null => {
-  try {
-    return localStorage.getItem(key)
-  } catch {
-    return null
-  }
-}
+/* Guarded storage access (readRaw/writeJSON) lives in cache.ts — a blocked
+   storage partition must not take the app down. */
 
 /**
  * Parse stored JSON, then hand it to a validator.
@@ -36,14 +45,6 @@ const readValidated = <T,>(key: string, validate: (v: unknown) => T): T => {
 /** Exported for tests; not part of the store surface. */
 export const asRepoList = (v: unknown): string[] =>
   Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.length > 0) : []
-
-const writeJSON = (key: string, value: unknown): void => {
-  try {
-    localStorage.setItem(key, JSON.stringify(value))
-  } catch {
-    /* storage unavailable (private mode, quota) — settings just don't persist */
-  }
-}
 
 /**
  * Persist on change, skipping the synchronous first emission Svelte delivers
@@ -181,6 +182,13 @@ persist(prefs, PREFS_KEY)
 export const authenticated = writable<boolean | null>(null)
 export const viewer = writable<Viewer | null>(null)
 
+// Cached so the next launch can hydrate account-keyed data (the fleet)
+// before the token probe answers. A null (signed out) is not written — the
+// probe deciding "no token" should not erase who was signed in last.
+viewer.subscribe((v) => {
+  if (v) writeCache(VIEWER_CACHE_KEY, '', v)
+})
+
 /**
  * Set when the keychain itself could not be reached, as opposed to there being
  * no credential stored — the two are indistinguishable once flattened into
@@ -224,8 +232,21 @@ export const dependabotLoaded = writable(false)
 export const issues = writable<Issue[]>([])
 export const issuesLoaded = writable(false)
 
-/** Repos whose result set was capped by the per-repo page limit. */
-export const truncatedRepos = writable<string[]>([])
+/**
+ * Repos whose result set was capped by the per-repo page limit, tracked per
+ * result kind so an issues sweep does not erase the pull-request sweep's
+ * warnings — including warnings hydrated from the cache before either sweep
+ * of this session has run.
+ */
+export const truncatedByKind = writable<{ pullRequests: string[]; issues: string[] }>({
+  pullRequests: [],
+  issues: [],
+})
+
+/** The union the views render. */
+export const truncatedRepos = derived(truncatedByKind, (t) => [
+  ...new Set([...t.pullRequests, ...t.issues]),
+])
 
 /** PRs staged for the merge dialog, or null when it is closed. */
 export const mergeDialog = writable<PullRequest[] | null>(null)
@@ -245,3 +266,68 @@ selectedRepos.subscribe((repos) => {
   dependabotLoaded.set(false)
   issuesLoaded.set(false)
 })
+
+// ---------------- cache hydration ----------------
+
+/**
+ * Fill the fetched-data stores from the last run's cache so launch renders
+ * the last known board instead of a spinner. Hydrated data is marked
+ * `loaded` — the stale-while-revalidate refresh (`refreshAtLaunch` in
+ * api.ts) runs with `force`, precisely so it never flips `loaded` back down
+ * and puts a spinner over a board that already has content.
+ *
+ * Entries are scope-checked by `readCache`: PR/issue caches against the
+ * current repo selection, the repo cache against the cached viewer's login —
+ * another account's fleet must not flash on screen after switching users.
+ */
+export const hydrateFromCache = (): void => {
+  // No cached viewer means no account to key any of the data by: hydrate
+  // nothing rather than guess whose board this was.
+  const me = readCache(VIEWER_CACHE_KEY, '', asCachedViewer)
+  if (!me) return
+
+  // Does not touch `authenticated` — only the token probe decides that.
+  viewer.set(me)
+  const repos = readCache(REPOS_CACHE_KEY, me.login, asCachedRepos)
+  if (repos) {
+    allRepos.set(repos)
+    allReposLoaded.set(true)
+  }
+
+  // Login-keyed on top of the repo selection: a token that expired lets a
+  // different account sign in without ever passing through Disconnect, and
+  // the previous account's board must not hydrate for it.
+  const scope = `${me.login}:${get(selectedRepos).join(',')}`
+  const dep = readCache(DEPENDABOT_CACHE_KEY, scope, asCachedDependabot)
+  if (dep) {
+    dependabotPRs.set(dep.prs)
+    dependabotLoaded.set(true)
+  }
+  const iss = readCache(ISSUES_CACHE_KEY, scope, asCachedIssues)
+  if (iss) {
+    issues.set(iss.issues)
+    issuesLoaded.set(true)
+  }
+  if (dep || iss) {
+    truncatedByKind.set({ pullRequests: dep?.truncated ?? [], issues: iss?.truncated ?? [] })
+  }
+}
+
+/**
+ * Forget everything fetched from GitHub — stores and disk cache both.
+ * Disconnect runs this so a shared machine keeps no readable trace of the
+ * account, and so a later sign-in (same session or next launch) starts from
+ * "not loaded" instead of silently showing the previous account's board.
+ */
+export const resetFetchedData = (): void => {
+  allRepos.set([])
+  allReposLoaded.set(false)
+  dependabotPRs.set([])
+  dependabotLoaded.set(false)
+  issues.set([])
+  issuesLoaded.set(false)
+  truncatedByKind.set({ pullRequests: [], issues: [] })
+  clearCache()
+}
+
+hydrateFromCache()

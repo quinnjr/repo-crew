@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import { activeView, anyModalOpen, authenticated, mergeDialog, toast } from './lib/stores'
     import { bootstrapSession } from './lib/auth'
-  import { refreshDependabot, refreshIssues } from './lib/api'
+  import { refreshAtLaunch, refreshDependabot, refreshIssues } from './lib/api'
   import Rail from './components/Rail.svelte'
   import Toasts from './components/Toasts.svelte'
   import CommandPalette from './components/CommandPalette.svelte'
@@ -20,6 +20,17 @@
 
   onMount(() => {
     bootstrapSession()
+    // On every false→true auth transition — stored token, fresh sign-in, and
+    // crucially a re-sign-in after Disconnect — refetch everything the cache
+    // hydrated. The views render whatever board is in the stores immediately;
+    // this swaps in fresh data behind it. A once-only latch here would leave
+    // a second account staring at the first account's data.
+    let wasAuthed = false
+    const unAuth = authenticated.subscribe((a) => {
+      const is = a === true
+      if (is && !wasAuthed) refreshAtLaunch()
+      wasAuthed = is
+    })
     const onKey = (e: KeyboardEvent) => {
       if (!((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k')) return
       // Never stack the palette on top of an open dialog — one Escape would
@@ -29,7 +40,10 @@
       paletteOpen = !paletteOpen
     }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    return () => {
+      unAuth()
+      window.removeEventListener('keydown', onKey)
+    }
   })
 
   /** Cancel is not a merge path: closing without merging changes nothing. */

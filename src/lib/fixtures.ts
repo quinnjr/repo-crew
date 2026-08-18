@@ -5,6 +5,25 @@ import type { PullRequest, Repo } from './types'
  * the app bundle never picks this module up.
  */
 
+/**
+ * Vitest runs in a node environment with no localStorage; tests that touch
+ * the cache install this Map-backed stub and remove it again in afterEach —
+ * removal doubles as the "storage missing entirely" fixture.
+ */
+export const installFakeStorage = (): Map<string, string> => {
+  const backing = new Map<string, string>()
+  ;(globalThis as Record<string, unknown>).localStorage = {
+    getItem: (k: string) => backing.get(k) ?? null,
+    setItem: (k: string, v: string) => void backing.set(k, v),
+    removeItem: (k: string) => void backing.delete(k),
+  }
+  return backing
+}
+
+export const removeFakeStorage = (): void => {
+  delete (globalThis as Record<string, unknown>).localStorage
+}
+
 let prCount = 0
 
 /** A fully-populated Dependabot pull request; override what the test cares about. */
