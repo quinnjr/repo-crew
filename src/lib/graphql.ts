@@ -518,13 +518,13 @@ export const mergePullRequest = async (
  */
 export const enableAutoMerge = async (
   pullRequestId: string,
-  {
-    method = 'SQUASH',
-    deleteBranch = false,
-    expectedHeadOid = null,
-  }: { method?: MergeMethod; deleteBranch?: boolean; expectedHeadOid?: string | null } = {},
+  { method = 'SQUASH', expectedHeadOid = null }: { method?: MergeMethod; expectedHeadOid?: string | null } = {},
 ) => {
-  const input: Vars = { pullRequestId, mergeMethod: method, deleteBranch }
+  // No deleteBranch here: EnablePullRequestAutoMergeInput has no such field,
+  // and an unknown field fails the WHOLE mutation — auto-merge silently never
+  // got enabled. Branch deletion for queued merges is GitHub's repo-level
+  // auto-delete setting; for direct merges it is deleteHeadRef below.
+  const input: Vars = { pullRequestId, mergeMethod: method }
   if (expectedHeadOid) input.expectedHeadOid = expectedHeadOid
   const { data } = await gql<{ enablePullRequestAutoMerge: unknown }>(
     `mutation($input: EnablePullRequestAutoMergeInput!) {
@@ -533,6 +533,27 @@ export const enableAutoMerge = async (
     { input },
   )
   return data?.enablePullRequestAutoMerge ?? null
+}
+
+/**
+ * Delete a merged pull request's head branch. Two steps because `deleteRef`
+ * wants the ref's node id, which the sweep doesn't carry.
+ *
+ * Returns false when the ref is already gone — the repo's own auto-delete
+ * setting often wins the race, and that is success from the user's point of
+ * view, not an error.
+ */
+export const deleteHeadRef = async (pullRequestId: string): Promise<boolean> => {
+  const { data } = await gql<{ node: { headRef: { id: string } | null } | null }>(
+    `query($id: ID!) { node(id: $id) { ... on PullRequest { headRef { id } } } }`,
+    { id: pullRequestId },
+  )
+  const refId = data?.node?.headRef?.id
+  if (!refId) return false
+  await gql(`mutation($input: DeleteRefInput!) { deleteRef(input: $input) { clientMutationId } }`, {
+    input: { refId },
+  })
+  return true
 }
 
 export const setIssueState = async (issueId: string, closed: boolean) => {
