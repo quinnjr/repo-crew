@@ -56,7 +56,7 @@ export const focusTrap: Action<HTMLElement> = (node) => {
     destroy() {
       cancelAnimationFrame(raf)
       node.removeEventListener('keydown', onKeydown)
-      previous?.focus?.()
+      previous?.focus()
     },
   }
 }

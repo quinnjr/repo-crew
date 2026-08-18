@@ -2,7 +2,7 @@
   import { onMount } from 'svelte'
   import { invoke } from '@tauri-apps/api/core'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { authenticated, prefs, theme, toast, viewer } from '../lib/stores'
+  import { authenticated, prefs, resetFetchedData, theme, toast, viewer } from '../lib/stores'
   import { cancelSignIn, INSTALLATIONS_URL, installUrl, oauthConfig, signInWithGitHub, SignInCancelled, type OauthConfig } from '../lib/auth'
   import Header from '../components/Header.svelte'
   import LoginLink from '../components/LoginLink.svelte'
@@ -56,6 +56,10 @@
     } finally {
       viewer.set(null)
       authenticated.set(false)
+      // Disconnect means forget: stores AND the disk cache. Leaving either
+      // populated would show this account's board to the next sign-in, and
+      // keep its data readable on a shared machine.
+      resetFetchedData()
     }
   }
 

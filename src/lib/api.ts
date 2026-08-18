@@ -8,10 +8,11 @@ import {
   issuesLoaded,
   selectedRepos,
   toast,
-  truncatedRepos,
+  truncatedByKind,
   viewer,
 } from './stores'
 import { fetchDependabotPRs, fetchIssues, fetchRepos, type Truncation } from './graphql'
+import { DEPENDABOT_CACHE_KEY, ISSUES_CACHE_KEY, REPOS_CACHE_KEY, writeCache } from './cache'
 import type { Repo } from './types'
 
 /** Raised when a load is attempted before the viewer is known. */
@@ -22,14 +23,32 @@ export class NotReadyError extends Error {
   }
 }
 
+/**
+ * Shared with the two sweep loaders' flight guards below: at launch,
+ * `refreshAtLaunch` and a mounting Fleet can both want the fleet at once,
+ * and each sweep's `reposInScope` may want it too — one fetch serves all.
+ */
+let reposFlight: Promise<void> | null = null
+
 export const loadRepos = async (force = false): Promise<void> => {
   const v = get(viewer)
   if (!v) throw new NotReadyError()
   if (get(allReposLoaded) && !force) return
-  allRepos.set(await fetchRepos(v.login))
-  // Only mark loaded once the fetch actually completed, so a failure is not
-  // cached for the rest of the session.
-  allReposLoaded.set(true)
+  if (reposFlight) return reposFlight
+  reposFlight = (async () => {
+    const repos = await fetchRepos(v.login)
+    allRepos.set(repos)
+    // Only mark loaded once the fetch actually completed, so a failure is not
+    // cached for the rest of the session.
+    allReposLoaded.set(true)
+    // Keyed by login so another account's fleet never hydrates after a switch.
+    writeCache(REPOS_CACHE_KEY, v.login, repos)
+  })()
+  try {
+    await reposFlight
+  } finally {
+    reposFlight = null
+  }
 }
 
 /**
@@ -59,14 +78,12 @@ const reposInScope = async (): Promise<string[]> => {
 }
 
 /**
- * Truncation is tracked per result kind so an issues sweep does not erase the
- * pull-request sweep's warnings (both loaders feed one `truncatedRepos` list).
+ * Per-kind state lives in the `truncatedByKind` store (not module state
+ * here) so cache hydration can seed it — a hydrated PR warning must survive
+ * an issues sweep that lands first.
  */
-const truncatedByKind: Record<Truncation['kind'], string[]> = { pullRequests: [], issues: [] }
-
 const noteTruncation = (kind: Truncation['kind'], repos: Truncation[]): void => {
-  truncatedByKind[kind] = [...new Set(repos.map((t) => t.repo))]
-  truncatedRepos.set([...new Set([...truncatedByKind.pullRequests, ...truncatedByKind.issues])])
+  truncatedByKind.update((t) => ({ ...t, [kind]: [...new Set(repos.map((x) => x.repo))] }))
 }
 
 /** Repos a sweep could not read: malformed names plus aliases GitHub nulled. */
@@ -98,6 +115,14 @@ export const loadDependabot = async (force = false): Promise<void> => {
     noteTruncation('pullRequests', truncated)
     surfaceMisses(skipped, failed, errors)
     dependabotLoaded.set(true)
+    // Login-keyed like hydration expects — see hydrateFromCache in stores.ts.
+    const login = get(viewer)?.login
+    if (login) {
+      writeCache(DEPENDABOT_CACHE_KEY, `${login}:${stamp}`, {
+        prs,
+        truncated: [...new Set(truncated.map((t) => t.repo))],
+      })
+    }
   })()
   try {
     await dependabotFlight
@@ -117,6 +142,13 @@ export const loadIssues = async (force = false): Promise<void> => {
     noteTruncation('issues', result.truncated)
     surfaceMisses(result.skipped, result.failed, result.errors)
     issuesLoaded.set(true)
+    const login = get(viewer)?.login
+    if (login) {
+      writeCache(ISSUES_CACHE_KEY, `${login}:${stamp}`, {
+        issues: result.issues,
+        truncated: [...new Set(result.truncated.map((t) => t.repo))],
+      })
+    }
   })()
   try {
     await issuesFlight
@@ -149,4 +181,30 @@ export const refreshIssues = async (): Promise<void> => {
     issuesLoaded.set(true)
     throw e
   }
+}
+
+/**
+ * The stale-while-revalidate half of the launch cache: hydration
+ * (`hydrateFromCache` in stores.ts) puts the last run's board on screen with
+ * `loaded` up, and this refetches everything behind it. Deliberately NOT the
+ * `refresh*` pair — those drop `loaded` first, which would put a spinner
+ * over a board that already has content. A failed refresh is toasted and the
+ * stale board stays; each view's own load call reports its own errors when
+ * there was nothing cached to show.
+ */
+export const refreshAtLaunch = async (): Promise<void> => {
+  const report = (what: string) => (e: unknown) => {
+    if (e instanceof NotReadyError) return
+    toast(`Could not refresh ${what}: ${e instanceof Error ? e.message : e}`, { kind: 'error' })
+  }
+  // The fleet strictly first: with no explicit selection the sweeps derive
+  // their scope from it, and a hydrated `allRepos` would otherwise satisfy
+  // `reposInScope` with LAST session's top-25 — the whole refresh would then
+  // sweep a stale scope and nothing would correct it. On failure the sweeps
+  // still run, falling back to whatever repo list exists.
+  await loadRepos(true).catch(report('the fleet'))
+  await Promise.all([
+    loadDependabot(true).catch(report('pull requests')),
+    loadIssues(true).catch(report('issues')),
+  ])
 }
