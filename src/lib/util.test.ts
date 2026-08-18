@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ago, bumpOf, checksInfo, flattenChecks, mergeInfo, millis, overallSignal, semverStep, shortRepo } from './util'
+import { ago, bumpOf, checksInfo, flattenChecks, mergeInfo, millis, overallSignal, semverStep, shortRepo, DEPENDABOT_REBASE_COMMENT, canPokeRebase } from './util'
 import { makePr as pr } from './fixtures'
 import type { Check, MergeStateStatus } from './types'
 
@@ -235,5 +235,21 @@ describe('millis / shortRepo', () => {
   it('takes the name half of nameWithOwner', () => {
     expect(shortRepo('acme/api-gateway')).toBe('api-gateway')
     expect(shortRepo('')).toBe('')
+  })
+})
+
+describe('canPokeRebase', () => {
+  it('offers a poke only where a rebase can help', () => {
+    expect(canPokeRebase(pr({ mergeStateStatus: 'BEHIND' }))).toBe(true)
+    expect(canPokeRebase(pr({ mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }))).toBe(true)
+    expect(canPokeRebase(pr({ mergeStateStatus: 'CLEAN' }))).toBe(false)
+    expect(canPokeRebase(pr({ mergeStateStatus: 'BLOCKED' }))).toBe(false)
+    expect(canPokeRebase(pr({ isDraft: true, mergeStateStatus: 'BEHIND' }))).toBe(false)
+  })
+})
+
+describe('DEPENDABOT_REBASE_COMMENT', () => {
+  it('is the literal command Dependabot listens for', () => {
+    expect(DEPENDABOT_REBASE_COMMENT).toBe('@dependabot rebase')
   })
 })

@@ -255,6 +255,20 @@ export const mergeInfo = (pr: PrLike): MergeReadout => {
   }
 }
 
+/** The comment body Dependabot listens for — commented verbatim on the PR. */
+export const DEPENDABOT_REBASE_COMMENT = '@dependabot rebase'
+
+/**
+ * Whether poking Dependabot for a rebase can actually change anything:
+ * BEHIND and DIRTY are the two states a rebase repairs. Anything else —
+ * ready, blocked by checks or reviews, draft, closed — would make the poke
+ * a no-op comment on the PR.
+ */
+export const canPokeRebase = (pr: PrLike): boolean => {
+  const { state } = mergeInfo(pr)
+  return state === 'BEHIND' || state === 'DIRTY'
+}
+
 /** Roll a PR's checks up into counts and one signal, in a single pass. */
 export const checksInfo = (pr: PrLike): ChecksReadout => {
   const checks = 'checks' in pr && pr.checks ? pr.checks : flattenChecks(pr)
