@@ -27,7 +27,8 @@ REPO_CREW_GH_APP_SLUG=…       # app slug, for the install-page links
 ## Sign-in (GitHub App)
 
 Sign-in is a browser OAuth flow against a GitHub App — the loopback pattern:
-the app listens once on `http://127.0.0.1:43117/callback`, opens
+the app listens on `http://127.0.0.1:43117/callback` — accepting until the
+redirect arrives, the five-minute deadline passes, or you cancel — opens
 github.com/login/oauth/authorize, and exchanges the redirect code for a
 user-to-server token. Organisation SSO happens in the browser like any other
 GitHub sign-in. The resulting credential (access token, plus refresh token
@@ -44,6 +45,16 @@ sign-in screen reports itself unconfigured. The GitHub App needs:
 - Callback URL `http://127.0.0.1:43117/callback`, webhook disabled
 - Repository permissions: Contents RW, Pull requests RW, Issues RW,
   Metadata RO
+
+The client secret is compiled into every binary we ship, including the Arch
+package, so anyone holding a build can recover it. That is the normal design
+for a desktop GitHub client (GitHub Desktop does the same), and PKCE is not an
+alternative here: GitHub does not support it for GitHub App user-to-server
+flows. So treat the secret as public — it is not a confidentiality boundary.
+What bounds the risk is the loopback redirect: a stolen secret can still only
+receive authorization codes delivered to `127.0.0.1:43117` on the victim's own
+machine. Rotate the secret if you suspect abuse, and turn on "Expire user
+authorization tokens" on the App so any intercepted user token is short-lived.
 
 There is **no app private key** in the binary, ever — user sign-in does not
 use one, and shipping it would hand out installation tokens for every install
@@ -63,11 +74,14 @@ pnpm lint         # oxlint over src/
 pnpm lint:rust    # cargo clippy -D warnings
 ```
 
-## Version pins worth knowing
+## Constraints
 
-- **TypeScript is pinned to major 6** (`^6`): svelte-check does not accept
+- **TypeScript is held at major 6** (`^6`): `svelte-check` rejects
   TypeScript 7. Do not let an upgrade sweep move it.
 - **webkit2gtk 4.1**, not 4.0 — Tauri v2 switched; packaging deps reflect it.
+- **Five gate commands**, all of which must pass before a commit and which CI
+  runs in this order: `pnpm check`, `pnpm lint`, `pnpm lint:rust`,
+  `pnpm test`, `pnpm build`.
 
 ## Branching
 
