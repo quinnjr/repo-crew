@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { flattenChecks } from './util'
-import { authenticated } from './stores'
+import { authenticated, keychainError } from './stores'
 import type { Issue, Label, LinkedPullRequest, MergeMethod, PullRequest, Repo, Viewer } from './types'
 
 export class AuthError extends Error {
@@ -61,6 +61,15 @@ export const gql = async <T = Record<string, unknown>>(
     throw new Error(message)
   }
   if (!res.ok) {
+    if (res.error === 'keychain_unavailable') {
+      // The other half of the condition `bootstrapSession` records at boot. A
+      // keyring that re-locks mid-session reported here as a raw
+      // `keychain_unavailable: …` toast while `authenticated` stayed true, so
+      // Welcome's keyring panel — and its Retry — were unreachable.
+      keychainError.set((res.detail ?? '').trim() || 'the system keychain is unavailable')
+      authenticated.set(false)
+      throw new AuthError()
+    }
     if (res.error === 'not_authenticated') {
       // No partial data exists to salvage from an auth failure, so it escapes
       // even `noThrow` callers. Flipping the store here is what routes a

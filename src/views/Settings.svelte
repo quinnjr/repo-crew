@@ -3,11 +3,12 @@
   import { invoke } from '@tauri-apps/api/core'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { authenticated, prefs, theme, toast, viewer } from '../lib/stores'
-  import { cancelSignIn, installUrl, oauthConfig, signInWithGitHub, SignInCancelled, type OauthConfig } from '../lib/auth'
+  import { cancelSignIn, INSTALLATIONS_URL, installUrl, oauthConfig, signInWithGitHub, SignInCancelled, type OauthConfig } from '../lib/auth'
   import Header from '../components/Header.svelte'
   import LoginLink from '../components/LoginLink.svelte'
   import type { MergeMethod } from '../lib/types'
   import type { Theme } from '../lib/stores'
+
 
   let signingIn = $state(false)
   let loginUrl = $state('')
@@ -110,15 +111,25 @@
         {#if signingIn && loginUrl}
           <LoginLink url={loginUrl} />
         {/if}
-        {#if cfg.slug}
-          <button
-            onclick={() => cfg.slug && openUrl(installUrl(cfg.slug))}
-            class="ml-auto rounded-sm border border-line-strong px-3 py-1.5 text-[11px] text-ink-2 transition-colors hover:bg-hover hover:text-ink"
-          >
-            <i class="fa-solid fa-up-right-from-square text-[10px]"></i> Manage app installation
-          </button>
-        {/if}
+        <button
+          onclick={() => openUrl(cfg.slug ? installUrl(cfg.slug) : INSTALLATIONS_URL)}
+          class="ml-auto rounded-sm border border-line-strong px-3 py-1.5 text-[11px] text-ink-2 transition-colors hover:bg-hover hover:text-ink"
+        >
+          <i class="fa-solid fa-up-right-from-square text-[10px]"></i> Manage app installation
+        </button>
       </div>
+      {#if !cfg.configured}
+        <!-- The button above is disabled in an unconfigured build; without this
+             the control is simply greyed out with no stated reason, while
+             Welcome explains the same condition in prose. Wording is kept
+             identical to Welcome's so the two screens agree. -->
+        <p class="mt-3 font-sans text-[11px] leading-relaxed text-ink-3">
+          This build has no sign-in credentials. It was compiled without
+          <span class="font-mono text-ink-2">REPO_CREW_GH_CLIENT_ID</span> and
+          <span class="font-mono text-ink-2">REPO_CREW_GH_CLIENT_SECRET</span>, so it cannot start the
+          GitHub sign-in. Rebuild with both set.
+        </p>
+      {/if}
       <p class="mt-3 font-sans text-[11px] leading-relaxed text-ink-3">
         Sign-in happens in your browser; the resulting credential lives in your system keychain,
         is never written to disk in plain text, and is never sent anywhere except github.com and

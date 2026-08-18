@@ -56,6 +56,10 @@ pub(crate) struct AppState {
     /// parallel queries cannot burn the same one (the loser would sign the
     /// whole app out).
     refresh_gate: Mutex<()>,
+    /// When an unreachable refresh may be retried. Without it, an offline sweep
+    /// re-attempts the refresh once per query, each attempt holding
+    /// `refresh_gate` for the full connect+read timeout.
+    refresh_backoff: Mutex<Option<std::time::Instant>>,
     /// Cancel flag for the in-flight browser sign-in, if any.
     pub(crate) login_cancel: Mutex<Option<Arc<AtomicBool>>>,
     /// One agent for the whole process: connection pooling and keep-alive,
@@ -97,6 +101,9 @@ pub(crate) fn parse_stored(raw: &str) -> Option<StoredToken> {
     match serde_json::from_str::<StoredToken>(trimmed) {
         Ok(token) if valid_token_bytes(&token.access) => Some(token),
         Ok(_) => None,
+        // A truncated JSON object is all ASCII-graphic, so without the `{`
+        // guard it passed as a bare token and got sent as a bearer credential.
+        Err(_) if trimmed.starts_with('{') => None,
         Err(_) => valid_token_bytes(trimmed).then(|| StoredToken {
             access: trimmed.to_string(),
             refresh: None,
@@ -121,6 +128,10 @@ fn pick_stored(
 
 /// Refresh a minute early so a token cannot expire between this check and the
 /// request that uses it.
+///
+/// ponytail: 60 s of skew, and exactly one retry per request in
+/// `execute_graphql`. Widen the window before adding retries if slow links or
+/// clock skew start producing spurious 401s.
 pub(crate) fn needs_refresh(expires_at: Option<u64>, now: u64) -> bool {
     matches!(expires_at, Some(t) if now + 60 >= t)
 }
@@ -147,7 +158,21 @@ fn migrate_legacy_token(app: &tauri::AppHandle) -> Option<String> {
         let _ = remove_legacy_file(&path);
         return None;
     }
-    match entry().and_then(|e| e.set_password(&token).map_err(|e| e.to_string())) {
+    // Encoded in the current schema so there is only ever one entry format —
+    // a bare string here would mint a NEW pre-schema entry after this release.
+    // Written straight to the keychain rather than through `store_token`: that
+    // also clears the `rejected` marker and seeds the cache, and this runs
+    // inside `resolve_token` *after* it captured `rejected`, so the migrated
+    // token would be filtered out while the cache kept serving it.
+    let migrated = StoredToken {
+        access: token.clone(),
+        refresh: None,
+        expires_at: None,
+    };
+    match serde_json::to_string(&migrated)
+        .map_err(|e| e.to_string())
+        .and_then(|raw| entry().and_then(|e| e.set_password(&raw).map_err(|e| e.to_string())))
+    {
         Ok(()) => {
             let _ = remove_legacy_file(&path);
             log::info!("migrated GitHub token from config file into the system keychain");
@@ -206,6 +231,39 @@ fn resolve_token(app: &tauri::AppHandle, state: &AppState) -> Result<Option<Stor
     Ok(token)
 }
 
+/// Whether storage has moved on from the credential we started with, i.e.
+/// another flow already refreshed it.
+///
+/// Pure so the double-spend guard can be tested without a keychain: refresh
+/// tokens are single-use, so re-sending one that another thread already spent
+/// gets a rejection that would then delete the newer, working credential.
+fn superseded(durable: Option<&StoredToken>, stale: &StoredToken) -> bool {
+    durable.is_some_and(|d| d.access != stale.access)
+}
+
+/// What a 401 means for the retry policy.
+#[derive(Debug, PartialEq)]
+enum Unauthorized {
+    /// Spend the one retry: refresh and send again.
+    TryRefresh,
+    /// End the session — no retry left, or nothing to retry with.
+    Dead,
+}
+
+/// Exactly one refresh-and-retry per request.
+///
+/// Pure because the alternative is untestable: dropping the `already_retried`
+/// guard turns a permanently-401ing token into a tight refresh loop that burns
+/// a single-use refresh token on every iteration, and every existing test
+/// stays green.
+fn on_401(already_retried: bool, has_refresh: bool) -> Unauthorized {
+    if !already_retried && has_refresh {
+        Unauthorized::TryRefresh
+    } else {
+        Unauthorized::Dead
+    }
+}
+
 /// What a refresh attempt concluded — the caller acts differently on each.
 enum RefreshOutcome {
     /// A fresh (or freshly-observed) credential to use.
@@ -215,31 +273,56 @@ enum RefreshOutcome {
     /// GitHub could not be asked. The credential is untouched: a network
     /// blip at the wrong moment must not sign the user out.
     Unreachable(String),
+    /// This build cannot refresh at all (no compiled-in credentials). Terminal
+    /// — retrying can never help — but the credential is KEPT, because it is
+    /// still valid and a rebuild with credentials would otherwise lose it.
+    Unusable(String),
 }
 
 /// Trade the refresh token for a new pair, serialised through `refresh_gate`.
 ///
 /// If another thread already refreshed while this one waited at the gate, its
 /// result is reused instead of burning the (single-use) refresh token twice.
-/// Only a definitive rejection clears the stored credential: the pair is dead
-/// then, and keeping it would loop the app through 401s forever. An expired
-/// token with no refresh token is equally dead and cleared the same way.
+/// Only a definitive rejection by GitHub clears the stored credential.
+///
+/// Everything else keeps it. Expiry is a local clock reading, not a verdict:
+/// clearing on it signed users out while GitHub still considered the grant
+/// live, and a forward clock jump (VM resume, NTP correction, dual-boot skew)
+/// triggered it immediately. An expired token with no refresh token is handed
+/// back instead, so the resulting 401 — GitHub's actual answer — is what
+/// clears it.
 fn refresh_and_store(app: &tauri::AppHandle, stale: &StoredToken) -> RefreshOutcome {
     let state = app.state::<AppState>();
     let _gate = lock(&state.refresh_gate);
 
-    if let Some(current) = lock(&state.token).clone() {
-        if current.access != stale.access {
+    if let Some(until) = *lock(&state.refresh_backoff) {
+        if std::time::Instant::now() < until {
+            return RefreshOutcome::Unreachable("still backing off a failed refresh".into());
+        }
+    }
+
+    // Past the gate, re-read the DURABLE copy, not just the cache. Keying this
+    // on the cache alone meant a cache cleared by a terminal 401 elsewhere let
+    // this thread re-send an already-spent single-use refresh token, and the
+    // resulting rejection then deleted the newer, good credential.
+    if let Some(current) = resolve_token(app, &state).ok().flatten() {
+        if superseded(Some(&current), stale) {
             return RefreshOutcome::Refreshed(current);
         }
     }
     let Some(refresh) = stale.refresh.clone() else {
-        log::info!("token expired with no refresh token; clearing the dead credential");
-        let _ = clear_stored(app);
-        return RefreshOutcome::Rejected;
+        log::info!("token is past its expiry and has no refresh token; letting GitHub be the verdict");
+        return RefreshOutcome::Refreshed(stale.clone());
     };
     match oauth::refresh_grant(&state.agent, &refresh) {
-        Ok(fresh) => {
+        Ok(mut fresh) => {
+            // GitHub normally rotates the refresh token, but a response that
+            // omits it must not null a working one — that silently disarmed
+            // refreshing and led to a sign-out at the next expiry.
+            if fresh.refresh.is_none() {
+                fresh.refresh = stale.refresh.clone();
+            }
+            *lock(&state.refresh_backoff) = None;
             if let Err(e) = store_token(app, &fresh) {
                 // The new token works for this session even if it could not
                 // be persisted; the next launch just signs in again.
@@ -250,12 +333,43 @@ fn refresh_and_store(app: &tauri::AppHandle, stale: &StoredToken) -> RefreshOutc
         }
         Err(oauth::TokenEndpointError::Rejected(e)) => {
             log::warn!("GitHub rejected the refresh token: {e}");
-            let _ = clear_stored(app);
+            // Clear only if the durable copy is still the pair we were told is
+            // dead. A concurrent flow may have replaced it since, and deleting
+            // *that* would turn one transient 401 into a hard sign-out — the
+            // `rejected` marker hides the newer entry from resolve_token, so
+            // the raw value has to be re-read here.
+            let durable = read_keychain().ok().flatten().as_deref().and_then(parse_stored);
+            if let Some(newer) = durable.filter(|d| superseded(Some(d), stale)) {
+                // Another flow replaced the credential while this refresh was in
+                // flight. The rejection was about the OLD pair, so the request
+                // must retry with the new one — returning Rejected here signed
+                // the user out seconds after a successful sign-in.
+                log::info!("another flow already replaced the credential; using it");
+                return RefreshOutcome::Refreshed(newer);
+            }
+            // A swallowed delete failure is the one case `clear_token`'s doc
+            // calls unacceptable: the dead entry survives, is read back next
+            // launch, 401s, and bounces the user to Welcome again — an
+            // unexplained sign-in loop across restarts.
+            if let Err(e) = clear_stored(app) {
+                log::warn!("signed out, but the credential could not be removed: {e}");
+            }
             RefreshOutcome::Rejected
         }
         Err(oauth::TokenEndpointError::Unreachable(e)) => {
             log::warn!("could not reach GitHub to refresh the token: {e}");
+            // ponytail: flat 15 s; make it exponential if flaky links start
+            // producing visible stalls between sweeps.
+            *lock(&state.refresh_backoff) =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
             RefreshOutcome::Unreachable(e)
+        }
+        Err(oauth::TokenEndpointError::Unusable(e)) => {
+            // Deliberately no clear: the stored token may still be perfectly
+            // good, it just cannot be refreshed by THIS build. Clearing would
+            // punish a rebuild without a .env by discarding a valid credential.
+            log::warn!("this build cannot refresh the session: {e}");
+            RefreshOutcome::Unusable(e)
         }
     }
 }
@@ -320,20 +434,35 @@ fn execute_graphql(app: &tauri::AppHandle, payload: Value) -> Value {
         }
     };
 
+    // Set when the proactive refresh already failed transiently, so the 401
+    // path below does not spend its one retry re-attempting the same call and
+    // re-sending a refresh token GitHub may already have rotated.
+    let mut refreshed = false;
+
     if needs_refresh(token.expires_at, now_unix()) {
         token = match refresh_and_store(app, &token) {
             RefreshOutcome::Refreshed(t) => t,
             RefreshOutcome::Rejected => {
                 return json!({ "ok": false, "error": "not_authenticated", "status": 0 })
             }
+            // Terminal, and the credential is intact: routing to sign-in lets
+            // Welcome explain that this build has no sign-in credentials,
+            // instead of failing every request forever with a transient error.
+            RefreshOutcome::Unusable(e) => {
+                return json!({ "ok": false, "error": "not_authenticated", "detail": e, "status": 0 })
+            }
             // GitHub is unreachable for refreshes, but this request may still
             // land inside the 60 s early-refresh window — and if the token is
             // truly dead, the 401 path below reports the real situation.
+            //
+            // The retry is deliberately NOT spent here: doing so let the
+            // following 401 fall straight through to `Dead`, which marks the
+            // access token rejected and hides the still-valid refresh token for
+            // the rest of the process. `refresh_backoff` is what stops an
+            // offline sweep re-attempting the refresh on every query.
             RefreshOutcome::Unreachable(_) => token,
         };
     }
-
-    let mut refreshed = false;
     loop {
         let response = state
             .agent
@@ -357,7 +486,7 @@ fn execute_graphql(app: &tauri::AppHandle, payload: Value) -> Value {
             Err(ureq::Error::Status(401, resp)) => {
                 // An 8-hour token can die mid-session; one refresh gets the
                 // sweep back without a trip through the sign-in screen.
-                if !refreshed && token.refresh.is_some() {
+                if on_401(refreshed, token.refresh.is_some()) == Unauthorized::TryRefresh {
                     refreshed = true;
                     match refresh_and_store(app, &token) {
                         RefreshOutcome::Refreshed(fresh) => {
@@ -375,6 +504,14 @@ fn execute_graphql(app: &tauri::AppHandle, payload: Value) -> Value {
                                 "ok": false,
                                 "error": format!("could not refresh the session: {e}"),
                                 "status": 0
+                            })
+                        }
+                        RefreshOutcome::Unusable(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "not_authenticated",
+                                "detail": e,
+                                "status": 401
                             })
                         }
                     }
@@ -437,6 +574,7 @@ pub fn run() {
             token: Mutex::new(None),
             rejected: Mutex::new(None),
             refresh_gate: Mutex::new(()),
+            refresh_backoff: Mutex::new(None),
             login_cancel: Mutex::new(None),
             agent: ureq::AgentBuilder::new()
                 .user_agent(concat!("repo-crew/", env!("CARGO_PKG_VERSION")))
@@ -489,6 +627,37 @@ mod tests {
 
         // The token path must still be usable rather than panicking.
         assert_eq!(lock(&m).clone(), Some(bare("gho_before")));
+    }
+
+    #[test]
+    fn a_refresh_that_lost_the_race_reuses_the_winners_credential() {
+        let stale = StoredToken {
+            access: "ghu_old".into(),
+            refresh: Some("ghr_1".into()),
+            expires_at: Some(100),
+        };
+        let fresh = StoredToken {
+            access: "ghu_new".into(),
+            refresh: Some("ghr_2".into()),
+            expires_at: Some(9_999),
+        };
+        // Storage moved on: reuse it rather than spending the single-use token
+        // again, and never delete it on a rejection meant for the old pair.
+        assert!(superseded(Some(&fresh), &stale));
+        // Storage still holds what we started with: this thread does the work.
+        assert!(!superseded(Some(&stale), &stale));
+        // Nothing stored at all is not evidence that anyone refreshed.
+        assert!(!superseded(None, &stale));
+    }
+
+    #[test]
+    fn a_401_is_retried_exactly_once_and_only_with_a_refresh_token() {
+        assert_eq!(on_401(false, true), Unauthorized::TryRefresh);
+        // The one retry is spent: a second 401 ends the session, never loops.
+        assert_eq!(on_401(true, true), Unauthorized::Dead);
+        // No refresh token means there is nothing to retry with.
+        assert_eq!(on_401(false, false), Unauthorized::Dead);
+        assert_eq!(on_401(true, false), Unauthorized::Dead);
     }
 
     #[test]
