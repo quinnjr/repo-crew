@@ -1,8 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { invoke } from '@tauri-apps/api/core'
-  import { activeView, anyModalOpen, authenticated, mergeDialog, toast, viewer } from './lib/stores'
-  import { fetchViewer } from './lib/graphql'
+  import { activeView, anyModalOpen, authenticated, mergeDialog, toast } from './lib/stores'
+    import { bootstrapSession } from './lib/auth'
   import { refreshDependabot, refreshIssues } from './lib/api'
   import Rail from './components/Rail.svelte'
   import Toasts from './components/Toasts.svelte'
@@ -19,45 +18,8 @@
 
   let paletteOpen = $state(false)
 
-  const boot = async () => {
-    // The backend answers whether a token exists; the secret itself never
-    // enters the webview. An IPC fault is reported rather than being shown as
-    // "no token", which would tell the user to paste one they already saved.
-    let stored: boolean
-    try {
-      stored = await invoke<boolean>('has_token')
-    } catch (e) {
-      authenticated.set(false)
-      toast(`Could not read the stored token: ${e instanceof Error ? e.message : e}`, {
-        kind: 'error',
-        sticky: true,
-      })
-      return
-    }
-
-    if (!stored) {
-      authenticated.set(false)
-      return
-    }
-
-    try {
-      const me = await fetchViewer()
-      // A null viewer with a stored token is a failure, not a signed-in state:
-      // every view needs the login, and `loadRepos` would throw on it anyway.
-      if (!me) throw new Error('GitHub returned no account for the stored token')
-      viewer.set(me)
-      authenticated.set(true)
-    } catch (e) {
-      authenticated.set(false)
-      toast(`That token no longer works: ${e instanceof Error ? e.message : e}`, {
-        kind: 'error',
-        sticky: true,
-      })
-    }
-  }
-
   onMount(() => {
-    boot()
+    bootstrapSession()
     const onKey = (e: KeyboardEvent) => {
       if (!((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k')) return
       // Never stack the palette on top of an open dialog — one Escape would

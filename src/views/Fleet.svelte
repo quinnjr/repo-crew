@@ -1,38 +1,68 @@
 <script lang="ts">
+  import { onMount } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { allRepos, allReposLoaded, goTo, selectedRepos, selectedRepoSet, toggleRepo, viewer, toast } from '../lib/stores'
+  import { allRepos, allReposLoaded, selectedRepos, selectedRepoSet, toggleRepo, viewer, toast } from '../lib/stores'
   import { loadRepos } from '../lib/api'
-  import { installUrl, oauthConfig } from '../lib/auth'
+  import { INSTALLATIONS_URL, installUrl, oauthConfig, type OauthConfig } from '../lib/auth'
   import { ago, pluralise } from '../lib/util'
   import Header from '../components/Header.svelte'
   import Spinner from '../components/Spinner.svelte'
   import EmptyState from '../components/EmptyState.svelte'
 
+
   let query = $state('')
   let showArchived = $state(false)
   let loading = $state(false)
-  let appSlug = $state<string | null>(null)
+  // Same shape and lifecycle as Welcome and Settings, so all three views read
+  // the config one way. Optimistic until the backend answers.
+  let cfg = $state<OauthConfig>({ configured: true, slug: null })
+  /**
+   * Why the list is empty, when it is empty because the fetch failed.
+   *
+   * Without this a rate limit or a 5xx fell through to the "app is not
+   * installed" empty state — a confident wrong diagnosis, with the only
+   * accurate explanation in a toast that had already faded.
+   */
+  let loadError = $state<string | null>(null)
 
-  $effect(() => {
+  onMount(() => {
     oauthConfig()
-      .then((c) => (appSlug = c.slug))
-      .catch(() => {})
+      .then((c) => (cfg = c))
+      // A failed probe is not fatal — the install links fall back to the
+      // slug-independent installations page — but it must not be silent, or the
+      // degraded wording below looks like the app's considered opinion.
+      .catch((e: unknown) => toast(`Could not read the sign-in config: ${e instanceof Error ? e.message : e}`, { kind: 'error' }))
   })
+
+  let attempted = false
 
   const load = async (force: boolean) => {
     if (loading) return
+    // A manual attempt re-arms the effect's one-shot guard, so Refresh and
+    // "Try again" keep working after an automatic attempt failed.
+    if (force) attempted = true
     loading = true
     try {
       await loadRepos(force)
+      loadError = null
     } catch (e) {
-      toast(`Could not load repositories: ${e instanceof Error ? e.message : e}`, { kind: 'error' })
+      loadError = e instanceof Error ? e.message : String(e)
+      // The panel below only renders when there is no list to replace, so a
+      // failed refresh over an existing list still needs the toast to report.
+      toast(`Could not load repositories: ${loadError}`, { kind: 'error' })
     } finally {
       loading = false
     }
   }
 
+  // Guarded by `attempted`, not by `loading`: `load` reads and writes `loading`
+  // inside the effect, which Svelte treats as self-invalidation — so a failing
+  // fetch (rate limit, 5xx) re-ran the effect on every `loading` flip and
+  // hammered the API at network speed, while the panel below offered a "Try
+  // again" button premised on the failure being terminal.
   $effect(() => {
-    if (!$viewer || $allReposLoaded) return
+    if (!$viewer || $allReposLoaded || attempted) return
+    attempted = true
     load(false)
   })
 
@@ -99,16 +129,28 @@
 
   {#if loading && !$allReposLoaded}
     <div class="flex flex-1 items-center justify-center"><Spinner label="Listing repositories…" /></div>
+  {:else if loadError && $allRepos.length === 0}
+    <!-- Ordered before the install-app state so a failed fetch is never
+         reported as a missing installation. Guarded on an empty list so a
+         failed manual refresh does not wipe the repos already on screen. -->
+    <EmptyState
+      icon="fa-solid fa-triangle-exclamation"
+      title="Could not load repositories"
+      body={loadError}
+      action={{ label: 'Try again', onclick: () => load(true) }}
+    />
   {:else if $allRepos.length === 0}
     <!-- The app only sees repositories where it is installed, so a fresh
          sign-in legitimately lands here — the install page is the way out. -->
     <EmptyState
       icon="fa-solid fa-layer-group"
       title="No repositories found"
-      body="Repo Crew can only see repositories where the GitHub App is installed. Install it on your account or organisation, then refresh."
-      action={appSlug
-        ? { label: 'Install the app on GitHub', onclick: () => appSlug && openUrl(installUrl(appSlug)) }
-        : { label: 'Open settings', onclick: () => goTo('settings') }}
+      body={cfg.slug
+        ? 'Repo Crew can only see repositories where the GitHub App is installed. Install it on your account or organisation, then refresh.'
+        : 'Repo Crew can only see repositories where the GitHub App is installed. This build could not look up the app’s own install page, so add it from your GitHub installations list, then refresh.'}
+      action={cfg.slug
+        ? { label: 'Install the app on GitHub', onclick: () => cfg.slug && openUrl(installUrl(cfg.slug)) }
+        : { label: 'Open GitHub installations', onclick: () => openUrl(INSTALLATIONS_URL) }}
     />
   {:else if filtered.length === 0}
     <EmptyState

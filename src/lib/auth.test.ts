@@ -1,49 +1,70 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
 
-const { invokeMock, listeners } = vi.hoisted(() => ({
+const { invokeMock, listeners, fetchViewerMock } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
   listeners: [] as ((e: { payload: unknown }) => void)[],
+  fetchViewerMock: vi.fn(),
 }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }))
 vi.mock('@tauri-apps/api/event', () => ({
-  listen: (_name: string, fn: (e: { payload: unknown }) => void) => {
-    listeners.push(fn)
-    return Promise.resolve(() => {
-      const i = listeners.indexOf(fn)
-      if (i >= 0) listeners.splice(i, 1)
-    })
-  },
+  // Registers only once the returned promise settles, mirroring the real IPC:
+  // the webview->core subscription is not live until then, and `emit` on the
+  // Rust side drops events with no listener. A mock that pushed synchronously
+  // made the "subscribes before starting the flow" test pass against the
+  // un-awaited version too, so it guarded nothing.
+  listen: (_name: string, fn: (e: { payload: unknown }) => void) =>
+    Promise.resolve().then(() => {
+      listeners.push(fn)
+      return () => {
+        const i = listeners.indexOf(fn)
+        if (i >= 0) listeners.splice(i, 1)
+      }
+    }),
 }))
-vi.mock('./graphql', () => ({
-  fetchViewer: vi.fn(async () => ({ id: 'U1', login: 'quinnjr', name: null, avatarUrl: null })),
-}))
+vi.mock('./graphql', () => ({ fetchViewer: fetchViewerMock }))
 
-import { cancelSignIn, installUrl, signInWithGitHub, SignInCancelled } from './auth'
+import { cancelSignIn, copyLoginLink, installUrl, signInWithGitHub, SignInCancelled } from './auth'
 import { authenticated, viewer } from './stores'
 
 const emitLogin = (payload: unknown) => {
-  for (const fn of [...listeners]) fn({ payload })
+  // Iterate a copy: a listener that settles the flow unsubscribes itself,
+  // mutating `listeners` mid-loop.
+  for (const fn of listeners.slice()) fn({ payload })
 }
 
-/** Let the promise chain inside signInWithGitHub reach its await points. */
-const settle = () => new Promise((r) => setTimeout(r, 0))
+/**
+ * Wait on the precondition `emitLogin` actually depends on, and fail loudly if
+ * it never holds: firing into an empty listener array leaves the sign-in
+ * promise pending, which shows up as the whole file hanging to the vitest
+ * timeout instead of as one failing assertion.
+ */
+const armed = async () => {
+  for (let i = 0; i < 50 && listeners.length === 0; i++) await Promise.resolve()
+  expect(listeners).toHaveLength(1)
+}
 
 beforeEach(() => {
   invokeMock.mockReset()
   invokeMock.mockResolvedValue(undefined)
+  fetchViewerMock.mockReset()
+  fetchViewerMock.mockResolvedValue({ id: 'U1', login: 'quinnjr', name: null, avatarUrl: null })
   listeners.length = 0
   authenticated.set(null)
   viewer.set(null)
 })
 
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
 describe('signInWithGitHub', () => {
   it('signs the session in when the backend reports ok', async () => {
     const flow = signInWithGitHub()
-    await settle()
-    expect(invokeMock).toHaveBeenCalledWith('start_github_login')
+    await armed()
     emitLogin({ ok: true })
     await flow
+    expect(invokeMock).toHaveBeenCalledWith('start_github_login')
     expect(get(authenticated)).toBe(true)
     expect(get(viewer)?.login).toBe('quinnjr')
   })
@@ -52,27 +73,54 @@ describe('signInWithGitHub', () => {
     invokeMock.mockResolvedValueOnce('https://github.com/login/oauth/authorize?client_id=x&state=y')
     const seen: string[] = []
     const flow = signInWithGitHub((url) => seen.push(url))
-    await settle()
-    expect(seen).toEqual(['https://github.com/login/oauth/authorize?client_id=x&state=y'])
+    await armed()
     emitLogin({ ok: true })
     await flow
+    expect(seen).toEqual(['https://github.com/login/oauth/authorize?client_id=x&state=y'])
+  })
+
+  it('subscribes to github-login before starting the flow', async () => {
+    // The backend's `emit` drops an event with no listener, so an event that
+    // lands the instant the browser returns must still be caught: the
+    // subscription has to exist before `start_github_login` is called at all.
+    const order: string[] = []
+    invokeMock.mockImplementationOnce(async () => {
+      order.push(`invoke:${listeners.length}`)
+      return 'https://github.com/login/oauth/authorize'
+    })
+    const flow = signInWithGitHub()
+    await armed()
+    emitLogin({ ok: true })
+    await flow
+    expect(order).toEqual(['invoke:1'])
   })
 
   it('surfaces the backend error and leaves the stores untouched', async () => {
     const flow = signInWithGitHub()
-    await settle()
-    emitLogin({ ok: false, error: 'callback state mismatch' })
-    await expect(flow).rejects.toThrow('callback state mismatch')
+    await armed()
+    emitLogin({ ok: false, error: 'timed out waiting for the browser — try signing in again' })
+    await expect(flow).rejects.toThrow('timed out waiting for the browser — try signing in again')
+    expect(get(authenticated)).toBeNull()
+    expect(get(viewer)).toBeNull()
+  })
+
+  it('does not claim to be signed out when the token stored but no account came back', async () => {
+    fetchViewerMock.mockResolvedValueOnce(null)
+    const flow = signInWithGitHub()
+    await armed()
+    emitLogin({ ok: true })
+    await expect(flow).rejects.toThrow(/^Signed in, but/)
+    // The credential is in the keychain, but nothing here may pretend the
+    // session is usable — the views read these two stores.
     expect(get(authenticated)).toBeNull()
     expect(get(viewer)).toBeNull()
   })
 
   it('stops listening once the flow settles', async () => {
     const flow = signInWithGitHub()
-    await settle()
+    await armed()
     emitLogin({ ok: true })
     await flow
-    await settle()
     expect(listeners).toHaveLength(0)
   })
 })
@@ -80,7 +128,7 @@ describe('signInWithGitHub', () => {
 describe('cancelSignIn', () => {
   it('rejects the pending flow with SignInCancelled and tells the backend', async () => {
     const flow = signInWithGitHub()
-    await settle()
+    await armed()
     await cancelSignIn()
     await expect(flow).rejects.toBeInstanceOf(SignInCancelled)
     expect(invokeMock).toHaveBeenCalledWith('cancel_github_login')
@@ -89,6 +137,50 @@ describe('cancelSignIn', () => {
   it('is safe to call with nothing in flight', async () => {
     invokeMock.mockRejectedValueOnce('no flow')
     await expect(cancelSignIn()).resolves.toBeUndefined()
+  })
+
+  it('still cancels a newer flow after an older one settled', async () => {
+    const first = signInWithGitHub()
+    await armed()
+    emitLogin({ ok: true })
+    await first
+
+    const second = signInWithGitHub()
+    await armed()
+    await cancelSignIn()
+    await expect(second).rejects.toBeInstanceOf(SignInCancelled)
+  })
+})
+
+describe('copyLoginLink', () => {
+  it('selects the input so Ctrl+C works when the clipboard is denied', async () => {
+    vi.stubGlobal('navigator', { clipboard: { writeText: vi.fn().mockRejectedValue(new Error('denied')) } })
+    const select = vi.fn()
+    await copyLoginLink('https://github.com/login/oauth/authorize', { select } as unknown as HTMLInputElement)
+    expect(select).toHaveBeenCalledOnce()
+  })
+
+  it('survives a denied clipboard with no input to fall back on', async () => {
+    vi.stubGlobal('navigator', { clipboard: { writeText: vi.fn().mockRejectedValue(new Error('denied')) } })
+    await expect(copyLoginLink('https://github.com/login/oauth/authorize', null)).resolves.toBeUndefined()
+  })
+})
+
+describe('oauthConfig', () => {
+  it('caches the answer but never a failure', async () => {
+    // Fresh module so the memo slot starts empty; the assertion that matters is
+    // the call count — a cached failure would brand the build unconfigured for
+    // the whole process after one transient IPC error.
+    vi.resetModules()
+    invokeMock.mockReset()
+    invokeMock.mockRejectedValueOnce('ipc unavailable')
+    invokeMock.mockResolvedValue({ configured: true, slug: 'repo-crew' })
+    const { oauthConfig } = await import('./auth')
+
+    await expect(oauthConfig()).rejects.toBe('ipc unavailable')
+    expect(await oauthConfig()).toEqual({ configured: true, slug: 'repo-crew' })
+    expect(await oauthConfig()).toEqual({ configured: true, slug: 'repo-crew' })
+    expect(invokeMock).toHaveBeenCalledTimes(2)
   })
 })
 

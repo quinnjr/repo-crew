@@ -181,6 +181,14 @@ persist(prefs, PREFS_KEY)
 export const authenticated = writable<boolean | null>(null)
 export const viewer = writable<Viewer | null>(null)
 
+/**
+ * Set when the keychain itself could not be reached, as opposed to there being
+ * no credential stored — the two are indistinguishable once flattened into
+ * `authenticated = false`, and the difference decides what we tell the user: a
+ * locked keyring needs starting, not another sign-in.
+ */
+export const keychainError = writable<string | null>(null)
+
 // ---------------- theme ----------------
 
 export type Theme = 'dark' | 'light'

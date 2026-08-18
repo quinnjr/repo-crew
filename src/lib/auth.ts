@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { authenticated, toast, viewer } from './stores'
+import { authenticated, keychainError, toast, viewer } from './stores'
 import { fetchViewer } from './graphql'
 
 /** What the backend is willing to tell the webview about the OAuth setup. */
@@ -15,6 +15,11 @@ export type OauthConfig = { configured: boolean; slug: string | null }
 let configFlight: Promise<OauthConfig> | null = null
 export const oauthConfig = (): Promise<OauthConfig> => {
   configFlight ??= invoke<OauthConfig>('oauth_config').catch((e: unknown) => {
+    // Load-bearing, not a tidy-up: dropping the flight on failure is what
+    // keeps the negative result out of the cache. Without it one dropped IPC
+    // call during startup would make every later caller — including the
+    // sign-in button's enablement check — believe the build ships no GitHub
+    // App for the rest of the process lifetime, with no way back but a restart.
     configFlight = null
     throw e
   })
@@ -37,6 +42,16 @@ export const copyLoginLink = async (url: string, fallback: HTMLInputElement | nu
 
 /** Where a user grants the GitHub App access to their repositories. */
 export const installUrl = (slug: string): string => `https://github.com/apps/${slug}/installations/new`
+
+/**
+ * The slug-independent fallback for "install this app somewhere".
+ *
+ * A build without `REPO_CREW_GH_APP_SLUG` cannot form the app's own install
+ * URL, and hiding the link entirely left the one correct instruction
+ * unreachable from every screen. This page always works.
+ */
+export const INSTALLATIONS_URL = 'https://github.com/settings/installations'
+
 
 type LoginEvent = { ok: boolean; error?: string }
 
@@ -65,30 +80,44 @@ let abandonPending: (() => void) | null = null
  * to open as non-fatal for exactly this path.
  */
 export const signInWithGitHub = async (onUrl?: (url: string) => void): Promise<void> => {
-  const unlistenReady = (() => {
-    let deliver: (e: LoginEvent) => void = () => {}
-    const outcome = new Promise<LoginEvent>((resolve, reject) => {
-      deliver = resolve
-      // The backend is silent about a cancelled flow, so the promise is
-      // settled from `cancelSignIn` instead of leaking a listener forever.
-      abandonPending = () => reject(new SignInCancelled())
-    })
-    return { unlisten: listen<LoginEvent>('github-login', (event) => deliver(event.payload)), outcome }
-  })()
+  let deliver: (e: LoginEvent) => void = () => {}
+  let abandon: () => void = () => {}
+  const outcome = new Promise<LoginEvent>((resolve, reject) => {
+    deliver = resolve
+    // The backend is silent about a cancelled flow, so the promise is
+    // settled from `cancelSignIn` instead of leaking a listener forever.
+    abandon = () => reject(new SignInCancelled())
+  })
+  abandonPending = abandon
 
+  let unlisten: (() => void) | null = null
   try {
+    // Awaited before the flow opens: `listen` resolves only once the
+    // webview→core subscription is registered, and Rust's `emit` silently
+    // drops an event nobody is listening for. Starting the login first races
+    // that registration, and losing the event leaves `outcome` pending
+    // forever — the UI sits on "Waiting for your browser…" past the backend's
+    // own deadline, with Cancel the only way out.
+    unlisten = await listen<LoginEvent>('github-login', (event) => deliver(event.payload))
+
     const url = await invoke<string>('start_github_login')
     onUrl?.(url)
-    const result = await unlistenReady.outcome
+    const result = await outcome
     if (!result.ok) throw new Error(result.error ?? 'sign-in failed')
 
     const me = await fetchViewer()
-    if (!me) throw new Error('GitHub returned no account for the new token')
+    // The token is already exchanged, verified and in the keychain by now, so
+    // this is not a failed sign-in and must not read like one — and no
+    // rollback: deleting a valid credential because one query came back empty
+    // would be the worse outcome. The next launch loads the account fine.
+    if (!me) throw new Error('Signed in, but your GitHub account could not be loaded — reopen the app')
     viewer.set(me)
     authenticated.set(true)
   } finally {
-    abandonPending = null
-    unlistenReady.unlisten.then((unlisten) => unlisten()).catch(() => {})
+    // A flow started after this one owns the slot now; only its own owner
+    // clears it, or cancelling the newer flow would silently do nothing.
+    if (abandonPending === abandon) abandonPending = null
+    unlisten?.()
   }
 }
 
@@ -98,4 +127,49 @@ export const cancelSignIn = async (): Promise<void> => {
   await invoke('cancel_github_login').catch(() => {
     /* nothing in flight */
   })
+}
+
+/**
+ * Probe the stored credential and settle `authenticated`/`viewer`/`keychainError`.
+ *
+ * Exported rather than living inside `App.svelte` so a view can genuinely
+ * re-run it: the keychain error state is recoverable (unlock the keyring, start
+ * gnome-keyring) and the only honest Retry is another probe, not a page reload.
+ */
+export const bootstrapSession = async (): Promise<void> => {
+  let stored: boolean
+  try {
+    stored = await invoke<boolean>('has_token')
+  } catch (e) {
+    // has_token only fails when the keychain itself is unusable — a locked or
+    // absent Secret Service. Recorded in a store, not just a dismissible toast,
+    // so Welcome can name the problem instead of inviting the user into a
+    // sign-in that would fail at the store step.
+    const message = e instanceof Error ? e.message : String(e)
+    keychainError.set(message)
+    authenticated.set(false)
+    toast(`Could not read the stored credential: ${message}`, { kind: 'error', sticky: true })
+    return
+  }
+  keychainError.set(null)
+
+  if (!stored) {
+    authenticated.set(false)
+    return
+  }
+
+  try {
+    const me = await fetchViewer()
+    // A null viewer with a stored token is a failure, not a signed-in state:
+    // every view needs the login, and `loadRepos` would throw on it anyway.
+    if (!me) throw new Error('GitHub returned no account for the stored token')
+    viewer.set(me)
+    authenticated.set(true)
+  } catch (e) {
+    authenticated.set(false)
+    toast(`That credential no longer works: ${e instanceof Error ? e.message : e}`, {
+      kind: 'error',
+      sticky: true,
+    })
+  }
 }

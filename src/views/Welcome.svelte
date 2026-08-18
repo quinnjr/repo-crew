@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { toast } from '../lib/stores'
-  import { cancelSignIn, installUrl, oauthConfig, signInWithGitHub, SignInCancelled, type OauthConfig } from '../lib/auth'
+  import { keychainError, toast } from '../lib/stores'
+  import { bootstrapSession, cancelSignIn, INSTALLATIONS_URL, installUrl, oauthConfig, signInWithGitHub, SignInCancelled, type OauthConfig } from '../lib/auth'
   import Spinner from '../components/Spinner.svelte'
   import LoginLink from '../components/LoginLink.svelte'
 
-  let waiting = $state(false)
+  let signingIn = $state(false)
   let loginUrl = $state('')
   // Optimistic: assume a configured build until the backend says otherwise,
   // so the button does not flash in and out on every launch.
@@ -18,15 +18,15 @@
       .catch(() => {})
     return () => {
       // Leaving the screen abandons the flow — nothing else could report it.
-      if (waiting) void cancelSignIn()
+      if (signingIn) void cancelSignIn()
     }
   })
 
-  const connect = async () => {
+  const signIn = async () => {
     // Re-entry guard: a duplicate click would start a second flow, silently
     // cancel the first, and strand its never-settling promise.
-    if (waiting) return
-    waiting = true
+    if (signingIn) return
+    signingIn = true
     try {
       await signInWithGitHub((url) => (loginUrl = url))
     } catch (e) {
@@ -34,13 +34,28 @@
         toast(`Could not sign in: ${e instanceof Error ? e.message : e}`, { kind: 'error', sticky: true })
       }
     } finally {
-      waiting = false
+      signingIn = false
       loginUrl = ''
     }
   }
 
   const cancel = () => {
     void cancelSignIn()
+  }
+
+  let retrying = $state(false)
+
+  // A locked keyring is recoverable without restarting anything: unlock it, or
+  // start gnome-keyring, then probe again. `bootstrapSession` re-derives every
+  // auth store from the answer, so this is a real retry rather than a reload.
+  const retry = async () => {
+    if (retrying) return
+    retrying = true
+    try {
+      await bootstrapSession()
+    } finally {
+      retrying = false
+    }
   }
 </script>
 
@@ -76,7 +91,28 @@
     </div>
 
     <div class="rounded-sm border border-line bg-panel p-5">
-      {#if !cfg.configured}
+      {#if $keychainError}
+        <!-- Named before the sign-in button, because sign-in cannot succeed:
+             the flow ends by writing the credential to the keychain we already
+             know we cannot reach. Sending the user through two browser round
+             trips to discover that would be a lie of omission. -->
+        <p class="font-sans text-[13px] leading-relaxed text-ink-2">
+          Your keyring is not available — start gnome-keyring, KWallet, or KeePassXC and try again.
+        </p>
+        <p class="mt-2 font-sans text-[11px] leading-relaxed text-ink-3">
+          Repo Crew keeps your GitHub credential in the system keychain and never writes it to disk,
+          so it cannot sign you in until the keyring answers. The keyring reported:
+          <span class="font-mono text-ink-2">{$keychainError}</span>
+        </p>
+        <button
+          onclick={retry}
+          disabled={retrying}
+          class="mt-4 flex w-full items-center justify-center gap-2 rounded-sm border border-brass/60 bg-brass/15 py-2.5 text-[12px] text-brass transition-colors hover:bg-brass/25 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <i class="fa-solid fa-rotate-right text-[12px]"></i>
+          Retry
+        </button>
+      {:else if !cfg.configured}
         <p class="font-sans text-[13px] leading-relaxed text-ink-2">
           This build has no sign-in credentials.
         </p>
@@ -85,7 +121,7 @@
           <span class="font-mono text-ink-2">REPO_CREW_GH_CLIENT_SECRET</span>, so it cannot start the
           GitHub sign-in. Rebuild with both set.
         </p>
-      {:else if waiting}
+      {:else if signingIn}
         <div class="flex items-center gap-3">
           <Spinner label="Waiting for your browser…" />
           <button
@@ -109,7 +145,7 @@
         {/if}
       {:else}
         <button
-          onclick={connect}
+          onclick={signIn}
           class="flex w-full items-center justify-center gap-2 rounded-sm border border-brass/60 bg-brass/15 py-2.5 text-[12px] text-brass transition-colors hover:bg-brass/25"
         >
           <i class="fa-brands fa-github text-[13px]"></i>
@@ -117,11 +153,10 @@
         </button>
         <p class="mt-3 font-sans text-[11px] leading-relaxed text-ink-3">
           Opens github.com in your browser; the app never sees your password. It can only reach
-          repositories where it is installed{#if cfg.slug}
-            — <button
-              onclick={() => cfg.slug && openUrl(installUrl(cfg.slug))}
-              class="text-brass underline underline-offset-2 hover:text-brass-hi"
-            >install it on your account</button>{/if}.
+          repositories where it is installed — <button
+            onclick={() => openUrl(cfg.slug ? installUrl(cfg.slug) : INSTALLATIONS_URL)}
+            class="text-brass underline underline-offset-2 hover:text-brass-hi"
+          >install it on your account</button>.
         </p>
       {/if}
     </div>
