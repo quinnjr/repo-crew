@@ -107,10 +107,12 @@
     else toast(`Auto-merge enabled on ${name}`, { kind: 'success' })
   }
 
-  /** In-scope, live repos still lacking auto-merge — what the bulk button works. */
-  const bulkTargets = $derived(
-    $allRepos.filter((r) => $selectedRepoSet.has(r.nameWithOwner) && !r.isArchived && !r.autoMergeAllowed),
-  )
+  /**
+   * Every shown, live repo still lacking auto-merge — "select all" semantics
+   * like the Select-shown action, independent of the scope checkboxes. The
+   * filter box still narrows it, so a targeted bulk run stays possible.
+   */
+  const bulkTargets = $derived(filtered.filter((r) => !r.isArchived && !r.autoMergeAllowed))
 
   let bulkRunning = $state(false)
 
