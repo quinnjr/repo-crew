@@ -60,7 +60,10 @@ prepare() {
 build() {
   cd "${srcdir}/${pkgname}"
   export RUSTUP_TOOLCHAIN=stable
-  export CARGO_TARGET_DIR=src-tauri/target
+  # Absolute, because the Tauri CLI invokes cargo from inside src-tauri/ —
+  # a relative path here lands the binary in src-tauri/src-tauri/target,
+  # where package() will not find it.
+  export CARGO_TARGET_DIR="${srcdir}/${pkgname}/src-tauri/target"
 
   # OAuth credentials are compiled in (option_env!) and never committed.
   # Without them the app builds but cannot sign anyone in, so fail loudly
