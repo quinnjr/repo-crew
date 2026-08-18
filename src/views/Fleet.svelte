@@ -78,20 +78,71 @@
 
   const allShown = $derived(filtered.length > 0 && filtered.every((r) => $selectedRepoSet.has(r.nameWithOwner)))
 
-  /** Repos whose auto-merge PATCH is in flight, so the button can't double-fire. */
+  /** Repos whose auto-merge PATCH is in flight, so the buttons can't double-fire. */
   let enabling = $state<Set<string>>(new Set())
 
-  const enableRepoAutoMerge = async (name: string) => {
-    if (enabling.has(name)) return
+  /** One PATCH; returns the failure message, or null on success. */
+  const enableOne = async (name: string): Promise<string | null> => {
     enabling = new Set(enabling).add(name)
     try {
       await setRepoAutoMerge(name, true)
       noteRepoAutoMerge(name, true)
-      toast(`Auto-merge enabled on ${name}`, { kind: 'success' })
+      return null
     } catch (e) {
-      toast(`Could not enable auto-merge on ${name}: ${e instanceof Error ? e.message : e}`, { kind: 'error' })
+      const raw = e instanceof Error ? e.message : String(e)
+      // GitHub's wording for "the App lacks a permission" names neither the
+      // permission nor the fix; changing repo settings needs Administration.
+      return raw.includes('Resource not accessible by integration')
+        ? 'the GitHub App is missing the "Administration" repository permission. Grant it in the app’s settings on GitHub, approve the updated permissions on your installation, then retry.'
+        : raw
     } finally {
       enabling = new Set([...enabling].filter((n) => n !== name))
+    }
+  }
+
+  const enableRepoAutoMerge = async (name: string) => {
+    if (enabling.has(name)) return
+    const err = await enableOne(name)
+    if (err) toast(`Could not enable auto-merge on ${name}: ${err}`, { kind: 'error', sticky: true })
+    else toast(`Auto-merge enabled on ${name}`, { kind: 'success' })
+  }
+
+  /** In-scope, live repos still lacking auto-merge — what the bulk button works. */
+  const bulkTargets = $derived(
+    $allRepos.filter((r) => $selectedRepoSet.has(r.nameWithOwner) && !r.isArchived && !r.autoMergeAllowed),
+  )
+
+  let bulkRunning = $state(false)
+
+  /**
+   * Serial, like the merge dialog's queue: repo-settings PATCHes are
+   * mutations, and GitHub's secondary rate limit punishes concurrent ones.
+   * Failures don't stop the run — the summary names what failed.
+   */
+  const enableBulk = async () => {
+    if (bulkRunning) return
+    const targets = bulkTargets.map((r) => r.nameWithOwner)
+    if (!targets.length) return
+    bulkRunning = true
+    try {
+      const failures: { name: string; err: string }[] = []
+      for (const name of targets) {
+        const err = await enableOne(name)
+        if (err) failures.push({ name, err })
+      }
+      if (failures.length === 0) {
+        toast(`Auto-merge enabled on ${pluralise(targets.length, 'repository', 'repositories')}`, {
+          kind: 'success',
+        })
+      } else {
+        const names = failures.map((f) => f.name).join(', ')
+        toast(
+          `${targets.length - failures.length} of ${targets.length} enabled — failed: ${names}. ${failures[0]!.err}`,
+          { kind: 'error', sticky: true },
+        )
+      }
+    } finally {
+      bulkRunning = false
     }
   }
 
@@ -110,6 +161,12 @@
   meta="Every other view acts on the repositories selected here"
   actions={[
     { label: allShown ? 'Deselect shown' : 'Select shown', icon: 'fa-check-double', onclick: toggleAll },
+    {
+      label: bulkRunning ? 'Enabling…' : `Enable auto-merge (${bulkTargets.length})`,
+      icon: 'fa-code-merge',
+      disabled: bulkRunning || bulkTargets.length === 0,
+      onclick: enableBulk,
+    },
     { label: 'Refresh', icon: 'fa-rotate-right', onclick: () => load(true) },
   ]}
 >

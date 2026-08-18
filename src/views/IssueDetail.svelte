@@ -1,7 +1,7 @@
 <script lang="ts">
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { activeIssue, goTo, prefs, toast } from '../lib/stores'
-  import { fetchIssueDetail, mergePullRequest, type IssueDetail } from '../lib/graphql'
+  import { addComment, fetchIssueDetail, mergePullRequest, type IssueDetail } from '../lib/graphql'
   import { ago, checksInfo, mergeInfo, pluralise } from '../lib/util'
   import Header from '../components/Header.svelte'
   import Signal from '../components/Signal.svelte'
@@ -20,6 +20,26 @@
   let loading = $state(true)
   let error = $state('')
   let merging = $state<string | null>(null)
+  let comment = $state('')
+  let commenting = $state(false)
+
+  const submitComment = async () => {
+    const body = comment.trim()
+    const ref = $activeIssue
+    if (!body || !issue || !ref || commenting) return
+    commenting = true
+    try {
+      await addComment(issue.id, body)
+      // Cleared only on success — a failed send must not eat the draft.
+      comment = ''
+      toast('Comment posted', { kind: 'success' })
+      await load(ref.repo, ref.number)
+    } catch (e) {
+      toast(`Could not comment: ${e instanceof Error ? e.message : e}`, { kind: 'error' })
+    } finally {
+      commenting = false
+    }
+  }
 
   const load = async (repo: string, number: number) => {
     loading = true
@@ -124,6 +144,31 @@
           {issue.body}
         </div>
       {/if}
+
+      <h3 class="engraved mt-8 mb-2">Add a comment</h3>
+      <div class="rounded-sm border border-line bg-panel p-3">
+        <textarea
+          bind:value={comment}
+          disabled={commenting}
+          rows="3"
+          placeholder="Write a comment — replies stay on GitHub"
+          onkeydown={(e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+              e.preventDefault()
+              submitComment()
+            }
+          }}
+          class="w-full resize-y rounded-sm border border-line-strong bg-field p-2 font-sans text-[13px] leading-relaxed text-ink placeholder:text-ink-3 focus:border-brass focus:outline-none"
+        ></textarea>
+        <div class="mt-2 flex items-center justify-between">
+          <span class="text-[11px] text-ink-3">Ctrl+Enter to send</span>
+          <button
+            onclick={submitComment}
+            disabled={commenting || comment.trim().length === 0}
+            class="rounded-sm border border-brass/60 bg-brass/15 px-2.5 py-1 text-[11px] text-brass transition-colors hover:bg-brass/25 disabled:cursor-not-allowed disabled:border-line disabled:bg-transparent disabled:text-ink-3"
+          >{commenting ? 'Commenting…' : 'Comment'}</button>
+        </div>
+      </div>
 
       <h3 class="engraved mt-8 mb-2">Closing pull requests</h3>
 
