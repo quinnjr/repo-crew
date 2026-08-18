@@ -12,7 +12,7 @@
     "tauri": "tauri",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run && cargo test --manifest-path src-tauri/Cargo.toml",
-    "lint": "oxlint src",
+    "lint": "oxlint src --deny-warnings",
     "lint:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings"
   },
   "devDependencies": {
