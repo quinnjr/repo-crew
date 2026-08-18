@@ -227,7 +227,7 @@ export const fetchRepos = async (owner: string): Promise<Repo[]> => {
               nodes {
                 id name nameWithOwner description isArchived isPrivate
                 primaryLanguage { name } stargazerCount updatedAt pushedAt
-                defaultBranchRef { name }
+                defaultBranchRef { name } autoMergeAllowed
               }
               pageInfo { endCursor hasNextPage }
             }
@@ -554,6 +554,19 @@ export const deleteHeadRef = async (pullRequestId: string): Promise<boolean> => 
     input: { refId },
   })
   return true
+}
+
+/**
+ * Flip a repository's "Allow auto-merge" setting.
+ *
+ * REST via a scoped Tauri command, not GraphQL: `UpdateRepositoryInput`
+ * carries no auto-merge field (verified by schema introspection), so the
+ * backend PATCHes `/repos/{owner}/{repo}` — the only API that can do this.
+ */
+export const setRepoAutoMerge = async (nameWithOwner: string, allow: boolean): Promise<void> => {
+  const [owner, repo, ...rest] = nameWithOwner.split('/')
+  if (!owner || !repo || rest.length > 0) throw new Error(`Not a full repo name: "${nameWithOwner}"`)
+  await invoke('set_repo_auto_merge', { owner, repo, allow })
 }
 
 export const setIssueState = async (issueId: string, closed: boolean) => {

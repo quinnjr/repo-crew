@@ -4,9 +4,9 @@ import { get } from 'svelte/store'
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }))
 
-import { AuthError, GraphQLError, deleteHeadRef, enableAutoMerge, fetchDependabotPRs, gql } from './graphql'
+import { AuthError, GraphQLError, deleteHeadRef, enableAutoMerge, fetchDependabotPRs, fetchRepos, gql, setRepoAutoMerge } from './graphql'
 import { authenticated } from './stores'
-import { makePr } from './fixtures'
+import { makePr, makeRepo } from './fixtures'
 
 beforeEach(() => {
   invokeMock.mockReset()
@@ -160,5 +160,45 @@ describe('deleteHeadRef', () => {
     })
     expect(await deleteHeadRef('PR_1')).toBe(false)
     expect(invokeMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('fetchRepos', () => {
+  it('requests and returns autoMergeAllowed', async () => {
+    invokeMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      data: {
+        data: {
+          repositoryOwner: {
+            repositories: {
+              nodes: [{ ...makeRepo(), autoMergeAllowed: false }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      },
+    })
+    const repos = await fetchRepos('octocat')
+    expect(repos[0]?.autoMergeAllowed).toBe(false)
+    const args = invokeMock.mock.calls[0]?.[1] as { query: string }
+    expect(args.query).toContain('autoMergeAllowed')
+  })
+})
+
+describe('setRepoAutoMerge', () => {
+  it('splits nameWithOwner and invokes the scoped command', async () => {
+    invokeMock.mockResolvedValue(null)
+    await setRepoAutoMerge('acme/api', true)
+    expect(invokeMock).toHaveBeenCalledWith('set_repo_auto_merge', {
+      owner: 'acme',
+      repo: 'api',
+      allow: true,
+    })
+  })
+
+  it('rejects a malformed repo name instead of PATCHing a wrong URL', async () => {
+    await expect(setRepoAutoMerge('not-a-full-name', true)).rejects.toThrow(/repo name/i)
+    expect(invokeMock).not.toHaveBeenCalled()
   })
 })
